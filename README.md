@@ -96,6 +96,17 @@ go vet ./...
 go test ./...
 ```
 
+## Releasing
+
+Versions are CalVer, `0.YYYYMM.MICRO` (same scheme as this org's other Go
+projects) — the same month increments `MICRO`, a new month resets it to
+`001`. Tags are the version prefixed with `v`.
+
+```bash
+./scripts/version.sh --dry-run    # preview the next version
+./scripts/version.sh              # bump VERSION, commit, tag, push
+```
+
 ## License
 
 [MIT](LICENSE)
