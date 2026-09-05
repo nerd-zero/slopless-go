@@ -1,6 +1,6 @@
 module github.com/nerd-zero/slopless-go
 
-go 1.26.5
+go 1.25.0
 
 require golang.org/x/tools v0.49.0
 
