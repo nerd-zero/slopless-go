@@ -16,18 +16,11 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: gofmt
-        run: |
-          unformatted=$(gofmt -l .)
-          if [ -n "$unformatted" ]; then
-            echo "::error::gofmt needed on:"; echo "$unformatted"; exit 1
-          fi
+      - name: make lint
+        run: make lint
 
-      - name: go vet
-        run: go vet ./...
-
-      - name: go build
-        run: go build ./...
+      - name: make build
+        run: make build
 
       # testdata/ is excluded from ./... by Go tooling convention, so build
       # each tool's demo explicitly too — it's real, runnable example code,
@@ -35,12 +28,12 @@ jobs:
       - name: build examples
         run: go build ./singlecaller/testdata/demo/...
 
-      - name: go test
-        run: go test ./... -race -count=1
+      - name: make test
+        run: make test
 
       # Advisory only: see singlecaller/README.md and BLOG.html for why
       # this never fails the build. "all" picks up every future tool
       # automatically — no need to extend this step per tool.
-      - name: slopless-go (self-check, every tool)
-        run: go run ./cmd/slopless-go all ./...
+      - name: make selfcheck
+        run: make selfcheck
         continue-on-error: true

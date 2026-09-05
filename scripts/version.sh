@@ -2,9 +2,15 @@
 #
 # version.sh — CalVer bump, and optionally commit + tag + push.
 #
-# Format: 0.YYYYMM.MICRO (MICRO is zero-padded to 3 digits, starts at 001).
-# Same scheme as payspace-go: same month increments MICRO, a new month
-# resets it to 001.
+# Format: 0.YYYYMM.MICRO (same month increments MICRO, a new month resets
+# it to 1). Same scheme this org uses elsewhere (e.g. the private church
+# repo), with one deliberate difference: MICRO is NOT zero-padded here.
+# This repo is a real Go module meant to be `go get`-able, and Go's module
+# resolver requires strict semver — golang.org/x/mod/semver rejects any
+# numeric identifier with a leading zero, so a tag like v0.202609.001
+# silently fails to resolve as a version at all (go get falls back to a
+# pseudo-version and then can't verify it against the checksum database).
+# v0.202609.1 is the same scheme, just valid semver.
 #
 # Usage:
 #   ./scripts/version.sh --bump-only  # write the next version to VERSION
@@ -48,10 +54,10 @@ CURRENT_MICRO="$(echo "$CURRENT" | cut -d. -f3)"
 NOW_YYYYMM="$(date -u +%Y%m)"
 
 if [[ "$NOW_YYYYMM" == "$CURRENT_YYYYMM" ]]; then
-    NEXT_MICRO="$(printf '%03d' $(( 10#$CURRENT_MICRO + 1 )))"
+    NEXT_MICRO=$(( 10#$CURRENT_MICRO + 1 ))
     NEXT="0.${NOW_YYYYMM}.${NEXT_MICRO}"
 else
-    NEXT="0.${NOW_YYYYMM}.001"
+    NEXT="0.${NOW_YYYYMM}.1"
 fi
 
 TAG="v${NEXT}"

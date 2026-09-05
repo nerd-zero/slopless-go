@@ -15,7 +15,7 @@ if ! git -C "$REPO_ROOT" diff --cached --name-only --diff-filter=ACM | grep -q '
 fi
 
 echo "Running slopless-go checks..."
-if ! output="$(cd "$REPO_ROOT" && go run ./cmd/slopless-go all ./... 2>&1)"; then
+if ! output="$(cd "$REPO_ROOT" && make selfcheck 2>&1)"; then
     echo ""
     echo "Found some candidates worth a look. Every check here is advisory"
     echo "— not blocking this commit:"

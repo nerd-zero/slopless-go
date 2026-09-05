@@ -90,21 +90,23 @@ A few conventions worth keeping:
 ## Local development
 
 ```bash
-git config core.hooksPath .githooks   # once, to enable the advisory pre-commit hook
-go build ./...
-go vet ./...
-go test ./...
+make install   # once, sets up the advisory pre-commit hook
+make check     # build, vet, gofmt, test — everything CI runs
+make help      # see every target
 ```
 
 ## Releasing
 
 Versions are CalVer, `0.YYYYMM.MICRO` (same scheme as this org's other Go
 projects) — the same month increments `MICRO`, a new month resets it to
-`001`. Tags are the version prefixed with `v`.
+`1`. Tags are the version prefixed with `v`. Unlike this org's other repos,
+`MICRO` is **not** zero-padded — Go's module resolver requires strict
+semver, which rejects leading zeros, so `v0.202609.1` is used instead of
+`v0.202609.001`.
 
 ```bash
-./scripts/version.sh --dry-run    # preview the next version
-./scripts/version.sh              # bump VERSION, commit, tag, push
+make version   # preview the next version
+make release   # bump VERSION, commit, tag, push
 ```
 
 ## License
