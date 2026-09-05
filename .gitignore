@@ -1,0 +1,5 @@
+/slopless-go
+/custom-gcl
+*.test
+*.out
+.DS_Store

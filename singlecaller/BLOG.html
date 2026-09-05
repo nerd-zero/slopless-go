@@ -1,0 +1,949 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The One-Caller Trap</title>
+<meta name="description" content="How a copy-pasted helper function led to a small Go static-analysis tool, and what nine false positives taught us about writing linters.">
+<style>
+  /* ============================================================
+     Design tokens — lifted from Archify's DESIGN.md, applied to
+     the diagram panels below. Dark-first; light mode preserves
+     category identity and priority, per the Theme Parity Rule.
+     https://github.com/tt-a1i/archify
+     ============================================================ */
+  :root{
+    --canvas:#020617; --mask:#0F172A; --ink:#FFFFFF;
+    --muted:#94A3B8; --dim:#475569; --border:#1E293B;
+    --frontend:#22D3EE; --backend:#34D399; --database:#A78BFA;
+    --cloud:#FBBF24; --security:#FB7185; --messagebus:#FB923C;
+    --external:#94A3B8;
+
+    --r-precise:0.2rem; --r-control:0.5rem; --r-panel:1rem; --r-pill:999px;
+    --sp-xs:0.25rem; --sp-sm:0.5rem; --sp-md:0.75rem; --sp-lg:1rem; --sp-xl:1.5rem; --sp-page:2rem;
+
+    --shadow-lift:0 28px 80px rgba(0,0,0,.34);
+    --shadow-panel:0 18px 48px rgba(0,0,0,.30);
+    --t-fast:160ms ease;
+
+    --font-mono:'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --font-sans:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+
+    /* page chrome (not the archify palette — the surrounding article) */
+    --page-bg:#08111F; --page-panel:#0D1729; --page-border:#1C2A40;
+    --page-ink:#E8EEF7; --page-muted:#8FA2BC; --page-accent:var(--frontend);
+  }
+  [data-theme="light"]{
+    --canvas:#F1F5F9; --mask:#FFFFFF; --ink:#0F172A;
+    --muted:#475569; --dim:#94A3B8; --border:#CBD5E1;
+    --frontend:#0891B2; --backend:#059669; --database:#7C3AED;
+    --cloud:#B45309; --security:#E11D48; --messagebus:#C2410C;
+    --external:#64748B;
+
+    --shadow-lift:0 20px 48px rgba(15,23,42,.12);
+    --shadow-panel:0 12px 28px rgba(15,23,42,.10);
+
+    --page-bg:#F8FAFC; --page-panel:#FFFFFF; --page-border:#E2E8F0;
+    --page-ink:#0F172A; --page-muted:#51617A; --page-accent:var(--frontend);
+  }
+  @media (prefers-reduced-motion: reduce){
+    *{ transition-duration:0.001ms !important; animation-duration:0.001ms !important; }
+  }
+
+  *{ box-sizing:border-box; }
+  html{ scroll-behavior:smooth; }
+  body{
+    margin:0; background:var(--page-bg); color:var(--page-ink);
+    font-family:var(--font-sans); line-height:1.65;
+    -webkit-font-smoothing:antialiased;
+  }
+  ::selection{ background:var(--page-accent); color:#031017; }
+
+  a{ color:var(--page-accent); }
+
+  .wrap{ max-width:760px; margin:0 auto; padding:0 var(--sp-page) 6rem; }
+
+  /* ---------- top bar ---------- */
+  .topbar{
+    position:sticky; top:0; z-index:20;
+    display:flex; align-items:center; justify-content:space-between;
+    padding:var(--sp-md) var(--sp-page);
+    background:color-mix(in srgb, var(--page-bg) 88%, transparent);
+    backdrop-filter:blur(10px);
+    border-bottom:1px solid var(--page-border);
+  }
+  .topbar .brand{
+    font-family:var(--font-mono); font-weight:700; font-size:0.75rem;
+    letter-spacing:0.12em; text-transform:uppercase; color:var(--page-muted);
+  }
+  .theme-toggle{
+    display:inline-flex; align-items:center; gap:var(--sp-sm);
+    background:var(--page-panel); color:var(--page-ink);
+    border:1px solid var(--page-border); border-radius:var(--r-pill);
+    font-family:var(--font-mono); font-size:0.7rem; font-weight:600;
+    padding:0.4rem 0.85rem; cursor:pointer; transition:border-color var(--t-fast), background var(--t-fast);
+  }
+  .theme-toggle:hover{ border-color:var(--page-accent); }
+  .theme-toggle:focus-visible{ outline:2px solid var(--page-accent); outline-offset:2px; }
+
+  /* ---------- hero ---------- */
+  .hero{ padding:4rem 0 2rem; }
+  .eyebrow{
+    font-family:var(--font-mono); font-size:0.625rem; font-weight:700;
+    letter-spacing:0.12em; text-transform:uppercase; color:var(--page-accent);
+    display:flex; align-items:center; gap:0.6rem; margin-bottom:1rem;
+  }
+  .eyebrow::before{ content:""; width:1.5rem; height:1px; background:var(--page-accent); }
+  h1{
+    font-family:var(--font-mono); font-size:clamp(2rem, 5vw, 2.75rem); font-weight:700;
+    line-height:1.15; letter-spacing:-0.025em; margin:0 0 1rem;
+  }
+  .dek{ font-size:1.15rem; color:var(--page-muted); max-width:56ch; margin:0 0 1.5rem; }
+  .byline{
+    display:flex; gap:1rem; align-items:center; flex-wrap:wrap;
+    font-family:var(--font-mono); font-size:0.75rem; color:var(--page-muted);
+    padding-top:1.25rem; border-top:1px solid var(--page-border);
+  }
+  .byline .dot{ opacity:0.5; }
+
+  /* ---------- article typography ---------- */
+  article h2{
+    font-family:var(--font-mono); font-size:1.4rem; font-weight:700;
+    letter-spacing:-0.01em; margin:3.25rem 0 1rem;
+  }
+  article h2 .num{ color:var(--page-accent); margin-right:0.5rem; }
+  article p{ font-size:1.02rem; color:var(--page-ink); margin:1.1rem 0; }
+  article p.lede{ font-size:1.12rem; color:var(--page-ink); }
+  article ul, article ol{ padding-left:1.3rem; }
+  article li{ margin:0.5rem 0; }
+  article strong{ color:var(--page-ink); }
+  code.inline{
+    font-family:var(--font-mono); font-size:0.87em; background:var(--page-panel);
+    border:1px solid var(--page-border); border-radius:var(--r-precise);
+    padding:0.1em 0.4em;
+  }
+  blockquote{
+    margin:1.75rem 0; padding:0.25rem 0 0.25rem 1.25rem;
+    border-left:3px solid var(--page-accent);
+    color:var(--page-muted); font-size:1.05rem; font-style:italic;
+  }
+
+  pre.code{
+    font-family:var(--font-mono); font-size:0.8rem; line-height:1.6;
+    background:var(--page-panel); border:1px solid var(--page-border);
+    border-radius:var(--r-control); padding:1rem 1.1rem; overflow-x:auto;
+    margin:1.5rem 0;
+  }
+  pre.code .k{ color:var(--database); }
+  pre.code .s{ color:var(--backend); }
+  pre.code .c{ color:var(--page-muted); font-style:italic; }
+  pre.code .fn{ color:var(--frontend); }
+
+  .callout{
+    display:flex; gap:0.9rem; align-items:flex-start;
+    background:var(--page-panel); border:1px solid var(--page-border);
+    border-left:3px solid var(--cloud);
+    border-radius:var(--r-control); padding:1rem 1.2rem; margin:1.75rem 0;
+    font-size:0.95rem; color:var(--page-muted);
+  }
+  .callout b{ color:var(--page-ink); }
+
+  hr.rule{ border:none; border-top:1px solid var(--page-border); margin:3.5rem 0; }
+
+  footer{
+    font-family:var(--font-mono); font-size:0.8rem; color:var(--page-muted);
+    padding-top:2rem; border-top:1px solid var(--page-border);
+  }
+  footer a{ color:var(--page-ink); }
+
+  /* ============================================================
+     Diagram panels — Archify's "diagram-panel" component:
+     mask background, panel corner radius, 1.5rem padding.
+     ============================================================ */
+  figure.diagram{ margin:2rem -1rem 2.5rem; }
+  .diagram-panel{
+    background:var(--mask); border:1px solid var(--border);
+    border-radius:var(--r-panel); box-shadow:var(--shadow-lift);
+    padding:var(--sp-xl); color:var(--ink); font-family:var(--font-mono);
+  }
+  .diagram-head{
+    display:flex; justify-content:space-between; align-items:baseline;
+    gap:1rem; margin-bottom:var(--sp-md); flex-wrap:wrap;
+  }
+  .diagram-title{ font-size:0.875rem; font-weight:600; }
+  .diagram-hint{
+    font-size:0.625rem; font-weight:700; letter-spacing:0.12em; text-transform:uppercase;
+    color:var(--muted);
+  }
+  figcaption{
+    font-family:var(--font-sans); font-size:0.85rem; color:var(--page-muted);
+    text-align:center; padding:0 1rem; margin-top:0.75rem;
+  }
+
+  svg.diagram-svg{ display:block; width:100%; height:auto; }
+  .node-rect{
+    fill:var(--canvas); stroke:var(--border); stroke-width:1.25;
+    transition:stroke var(--t-fast), opacity var(--t-fast), filter var(--t-fast);
+  }
+  .node-label{
+    font-family:var(--font-mono); font-size:9px; font-weight:600; fill:var(--ink);
+    transition:opacity var(--t-fast);
+  }
+  .node-sub{
+    font-family:var(--font-mono); font-size:7px; font-weight:700; letter-spacing:0.08em;
+    text-transform:uppercase; fill:var(--muted);
+  }
+  .edge{
+    fill:none; stroke:var(--dim); stroke-width:1.25;
+    transition:stroke var(--t-fast), opacity var(--t-fast), stroke-width var(--t-fast);
+  }
+  .dimmed{ opacity:0.32; }
+  .node-group, .helper-node{ transition:opacity var(--t-fast); }
+  .traced .node-rect{ stroke:var(--database) !important; }
+  .edge.traced{ stroke:var(--database); stroke-width:2; }
+  .pill{
+    font-family:var(--font-mono); font-size:7px; font-weight:700; letter-spacing:0.1em;
+    text-transform:uppercase;
+  }
+  .legend{
+    display:flex; gap:1.25rem; flex-wrap:wrap; margin-top:var(--sp-lg);
+    padding-top:var(--sp-md); border-top:1px solid var(--border);
+  }
+  .legend-item{ display:flex; align-items:center; gap:0.4rem; font-size:0.625rem; letter-spacing:0.06em; color:var(--muted); text-transform:uppercase; }
+  .legend-swatch{ width:9px; height:9px; border-radius:2px; }
+
+  .helper-node{ cursor:pointer; }
+  .helper-node:focus-visible .node-rect{ stroke:var(--frontend); stroke-width:2; }
+
+  .stage-node{ cursor:pointer; }
+  .stage-node .node-rect{ cursor:pointer; }
+  .stage-node.active .node-rect{ stroke-width:2; filter:drop-shadow(0 0 6px currentColor); }
+
+  .detail-card{
+    margin-top:var(--sp-lg); background:var(--canvas); border:1px solid var(--border);
+    border-radius:var(--r-control); padding:var(--sp-md) var(--sp-lg);
+    font-family:var(--font-sans); font-size:0.85rem; color:var(--muted);
+    min-height:3.2rem; display:flex; align-items:center; gap:0.9rem;
+    transition:border-color var(--t-fast);
+  }
+  .detail-card .tag{
+    font-family:var(--font-mono); font-size:0.625rem; font-weight:700; letter-spacing:0.1em;
+    text-transform:uppercase; padding:0.2rem 0.5rem; border-radius:var(--r-precise);
+    flex-shrink:0;
+  }
+  .detail-card code{ font-family:var(--font-mono); color:var(--ink); font-size:0.8rem; }
+
+  @media (max-width:640px){
+    .wrap{ padding:0 1.1rem 4rem; }
+    .diagram-panel{ padding:1.1rem; border-radius:var(--r-control); }
+    figure.diagram{ margin-left:0; margin-right:0; }
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <span class="brand">api/tools/singlecaller</span>
+  <button class="theme-toggle" id="themeToggle" type="button" aria-label="Toggle color theme">
+    <span id="themeIcon">☾</span> <span id="themeLabel">Dark</span>
+  </button>
+</div>
+
+<div class="wrap">
+
+  <header class="hero">
+    <div class="eyebrow">Engineering notes</div>
+    <h1>The One-Caller Trap</h1>
+    <p class="dek">
+      A helper function copied from a proven pattern, a reviewer asking
+      "wait, who else calls this?", and a small static-analysis tool built
+      to ask that question automatically — plus the false positives that
+      taught it some manners. (Examples below are a small, self-contained
+      demo built for this post, not excerpts from any real codebase.)
+    </p>
+    <div class="byline">
+      <span>Backend / tooling</span>
+      <span class="dot">·</span>
+      <span>~8 min read</span>
+      <span class="dot">·</span>
+      <span>Go, go/analysis</span>
+    </div>
+  </header>
+
+  <article>
+
+    <p class="lede">
+      It started with a small builder function, copied from a pattern that
+      was already working well elsewhere in the same codebase. Not an
+      unusual move — most of a CRUD-shaped service is the fourth or fifth
+      repetition of something, and copying the third one's structure and
+      swapping the nouns is normal, healthy reuse. Except this time the
+      thing being reused didn't actually apply.
+    </p>
+
+    <p>
+      The pattern in question is a small conversion layer, the kind almost
+      every Go service that talks to a database ends up with: a
+      code generator (sqlc, ent, sqlboiler, hand-rolled scanning — take your
+      pick) produces a distinct Go struct for every SQL query's result row,
+      and a one-line builder turns that row into the domain type the rest
+      of the app actually works with. For one entity — call it
+      <code class="inline">Order</code> — that builder is
+      <code class="inline">orderFromFields</code>, and it earns its keep
+      honestly: <code class="inline">ListOrders</code>,
+      <code class="inline">GetOrder</code>,
+      <code class="inline">CreateOrder</code>, and
+      <code class="inline">UpdateOrder</code> each produce their own
+      distinct row type, and all four need converting the same way. One
+      builder, four callers, zero duplication.
+    </p>
+
+    <p>
+      A neighboring entity — call it <code class="inline">Customer</code> —
+      got the same treatment: a private <code class="inline">customerFromFields</code>
+      builder, called from a <code class="inline">GetCustomer</code>
+      wrapper, exactly like its <code class="inline">Order</code>
+      counterpart. It compiled. It worked. It also, as it turned out, had
+      exactly one caller — because every one of <code class="inline">Customer</code>'s
+      queries happens to return the very same row type. There was never a
+      second shape to reconcile.
+    </p>
+
+    <h2><span class="num">01</span>Fan-in is the whole story</h2>
+
+    <p>
+      The pattern isn't wrong in the abstract — it's wrong for
+      <code class="inline">Customer</code> specifically, and the reason
+      is entirely about how many distinct
+      callers actually exist. Here's the same shape, side by side, with
+      the caller count that makes one version earn its place and the
+      other version pointless:
+    </p>
+
+    <figure class="diagram">
+      <div class="diagram-panel">
+        <div class="diagram-head">
+          <span class="diagram-title">Fan-in: the whole difference</span>
+          <span class="diagram-hint">Click a builder to trace its callers</span>
+        </div>
+        <svg class="diagram-svg" viewBox="0 0 920 300" role="img" aria-labelledby="d1-title d1-desc">
+          <title id="d1-title">Comparing a shared row builder against a single-use one</title>
+          <desc id="d1-desc">Left: four distinct row-conversion functions all call orderFromFields — a justified shared builder. Right: one function calls customerFromFields — a single-use builder that should be inlined.</desc>
+          <defs>
+            <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M0,0 L8,4 L0,8 z" fill="var(--dim)"></path>
+            </marker>
+          </defs>
+
+          <!-- left panel label -->
+          <text x="16" y="24" class="node-sub">orders.go — justified</text>
+          <!-- right panel label -->
+          <text x="500" y="24" class="node-sub">customer.go — flagged</text>
+
+          <!-- divider -->
+          <line x1="460" y1="10" x2="460" y2="270" stroke="var(--border)" stroke-width="1"></line>
+
+          <!-- LEFT: 4 callers -->
+          <g id="d1-callers-orders">
+            <g class="node-group" transform="translate(20,50)">
+              <rect class="node-rect" width="190" height="30" rx="6"></rect>
+              <text x="12" y="19" class="node-label">ListOrders</text>
+            </g>
+            <g class="node-group" transform="translate(20,94)">
+              <rect class="node-rect" width="190" height="30" rx="6"></rect>
+              <text x="12" y="19" class="node-label">GetOrder</text>
+            </g>
+            <g class="node-group" transform="translate(20,138)">
+              <rect class="node-rect" width="190" height="30" rx="6"></rect>
+              <text x="12" y="19" class="node-label">CreateOrder</text>
+            </g>
+            <g class="node-group" transform="translate(20,182)">
+              <rect class="node-rect" width="190" height="30" rx="6"></rect>
+              <text x="12" y="19" class="node-label">UpdateOrder</text>
+            </g>
+          </g>
+
+          <!-- edges: 4 callers -> orderFromFields -->
+          <g id="d1-edges-orders">
+            <path class="edge" data-for="orders" marker-end="url(#arrow)" d="M210,65 C260,65 260,110 300,110"></path>
+            <path class="edge" data-for="orders" marker-end="url(#arrow)" d="M210,109 C260,109 260,110 300,110"></path>
+            <path class="edge" data-for="orders" marker-end="url(#arrow)" d="M210,153 C260,153 260,120 300,120"></path>
+            <path class="edge" data-for="orders" marker-end="url(#arrow)" d="M210,197 C260,197 260,130 300,130"></path>
+          </g>
+
+          <!-- orderFromFields helper -->
+          <g class="helper-node" id="helper-orders" tabindex="0" role="button" aria-pressed="false" transform="translate(300,90)">
+            <rect class="node-rect" width="150" height="50" rx="8" style="stroke:var(--backend)"></rect>
+            <text x="75" y="22" text-anchor="middle" class="node-label">orderFromFields</text>
+            <text x="75" y="36" text-anchor="middle" class="node-sub" style="fill:var(--backend)">4 callers</text>
+          </g>
+
+          <!-- RIGHT: 1 caller -->
+          <g id="d1-callers-customer">
+            <g class="node-group" transform="translate(500,110)">
+              <rect class="node-rect" width="190" height="30" rx="6"></rect>
+              <text x="12" y="19" class="node-label">GetCustomer</text>
+            </g>
+          </g>
+          <g id="d1-edges-customer">
+            <path class="edge" data-for="customer" marker-end="url(#arrow)" d="M690,125 C730,125 730,125 760,125"></path>
+          </g>
+          <g class="helper-node" id="helper-customer" tabindex="0" role="button" aria-pressed="false" transform="translate(760,100)">
+            <rect class="node-rect" width="150" height="50" rx="8" style="stroke:var(--security)"></rect>
+            <text x="75" y="22" text-anchor="middle" class="node-label">customerFromFields</text>
+            <text x="75" y="36" text-anchor="middle" class="node-sub" style="fill:var(--security)">1 caller — inline it</text>
+          </g>
+
+          <!-- annotations -->
+          <text x="500" y="230" class="node-sub" style="fill:var(--muted)">There's only ever one CustomerRow —</text>
+          <text x="500" y="244" class="node-sub" style="fill:var(--muted)">never a second shape to reconcile.</text>
+        </svg>
+
+        <div class="legend">
+          <div class="legend-item"><span class="legend-swatch" style="background:var(--backend)"></span>Earns its keep</div>
+          <div class="legend-item"><span class="legend-swatch" style="background:var(--security)"></span>Pointless indirection</div>
+          <div class="legend-item"><span class="legend-swatch" style="background:var(--database)"></span>Traced callers (on click)</div>
+        </div>
+      </div>
+      <figcaption>Same pattern, same author, same file layout. The only variable that matters is fan-in.</figcaption>
+    </figure>
+
+    <p>
+      The fix, once you see it that way, is a one-line inline — replace
+      the call with the struct literal it was always going to build, and
+      delete the middleman. That's a two-minute change. The more
+      interesting question is the one that came up right after:
+    </p>
+
+    <blockquote>"Can a linter catch this so we don't have to notice it by hand next time?"</blockquote>
+
+    <h2><span class="num">02</span>Why <code class="inline">go vet</code> shrugs</h2>
+
+    <p>
+      The instinctive answer is <code class="inline">unused</code> —
+      staticcheck's dead-code checker, a standard entry in most
+      <code class="inline">golangci-lint</code> configs. It doesn't apply
+      here, and the reason matters:
+      <code class="inline">customerFromFields</code> isn't dead. It's
+      called. Exactly once, but once is not zero, and "used" is precisely
+      the bar <code class="inline">unused</code> checks.
+    </p>
+
+    <p>
+      Widen the search and the same problem shows up everywhere —
+      <code class="inline">gocritic</code>, <code class="inline">revive</code>,
+      <code class="inline">unparam</code> — because a rule like "flag any
+      unexported function with one caller" would be actively bad advice
+      applied blindly. Breaking a long function into a named, single-use
+      piece is often <em>exactly</em> the right move for readability. A
+      linter that punished every one-caller extraction would train people
+      to stop doing that, which is a worse codebase than the one with an
+      occasional unnecessary builder in it.
+    </p>
+
+    <p>
+      What actually made <code class="inline">customerFromFields</code>
+      wrong wasn't "one caller" as an abstract fact. It was that the
+      <em>reason</em> the pattern existed — reconciling several distinct
+      row shapes — didn't hold for <code class="inline">Customer</code>.
+      No linter can know that without understanding how this particular
+      codebase generates row types, which is exactly the kind of
+      repo-specific context a general-purpose tool shouldn't try to encode.
+      So instead of forcing this into an existing linter's rule set, it
+      became a purpose-built tool: small, honest about what it can and
+      can't judge, and easy to run as one more check in the pipeline.
+    </p>
+
+    <h2><span class="num">03</span>What the tool actually does</h2>
+
+    <p>
+      <code class="inline">go/analysis</code> — the framework behind
+      <code class="inline">go vet</code> itself — turns this into a short
+      program. Give it a package, and it hands back full type information:
+      every identifier's declaration (<code class="inline">Defs</code>) and
+      every place that identifier gets used
+      (<code class="inline">Uses</code>), already resolved across files.
+      That's the whole trick: don't grep for a function name in text, walk
+      the type-checked syntax tree and count.
+    </p>
+
+    <figure class="diagram">
+      <div class="diagram-panel">
+        <div class="diagram-head">
+          <span class="diagram-title">How singlecaller decides</span>
+          <span class="diagram-hint">Click a stage</span>
+        </div>
+        <svg class="diagram-svg" id="d2-svg" viewBox="0 0 1080 190" role="img" aria-labelledby="d2-title d2-desc">
+          <title id="d2-title">The six-stage pipeline singlecaller runs per package</title>
+          <desc id="d2-desc">Parse and collect candidate declarations, filter out generated code and long or entry-point functions, walk call expressions resolved through the type checker, tally calls per symbol, score the one call site's cyclomatic complexity, then report any symbol called exactly once from a call site that isn't already complex.</desc>
+          <defs>
+            <marker id="arrow2" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M0,0 L8,4 L0,8 z" fill="var(--dim)"></path>
+            </marker>
+          </defs>
+
+          <g id="d2-stages">
+            <!-- connectors drawn first, underneath nodes -->
+            <path class="edge" marker-end="url(#arrow2)" d="M145,90 L175,90"></path>
+            <path class="edge" marker-end="url(#arrow2)" d="M310,90 L340,90"></path>
+            <path class="edge" marker-end="url(#arrow2)" d="M480,90 L510,90"></path>
+            <path class="edge" marker-end="url(#arrow2)" d="M630,90 L660,90"></path>
+            <path class="edge" marker-end="url(#arrow2)" d="M810,90 L840,90"></path>
+          </g>
+
+          <!-- stage 1 -->
+          <g class="stage-node" data-stage="1" tabindex="0" role="button" transform="translate(10,55)">
+            <rect class="node-rect" width="135" height="70" rx="8" style="stroke:var(--frontend);color:var(--frontend)"></rect>
+            <text x="67" y="30" text-anchor="middle" class="node-label">Collect</text>
+            <text x="67" y="44" text-anchor="middle" class="node-sub">unexported funcs</text>
+          </g>
+          <!-- stage 2 -->
+          <g class="stage-node" data-stage="2" tabindex="0" role="button" transform="translate(175,55)">
+            <rect class="node-rect" width="135" height="70" rx="8" style="stroke:var(--security);color:var(--security)"></rect>
+            <text x="67" y="24" text-anchor="middle" class="node-label">Filter out</text>
+            <text x="67" y="38" text-anchor="middle" class="node-sub">generated / main</text>
+            <text x="67" y="50" text-anchor="middle" class="node-sub">/ long bodies</text>
+          </g>
+          <!-- stage 3 -->
+          <g class="stage-node" data-stage="3" tabindex="0" role="button" transform="translate(340,55)">
+            <rect class="node-rect" width="140" height="70" rx="8" style="stroke:var(--backend);color:var(--backend)"></rect>
+            <text x="70" y="30" text-anchor="middle" class="node-label">Walk calls</text>
+            <text x="70" y="44" text-anchor="middle" class="node-sub">resolve via types.Uses</text>
+          </g>
+          <!-- stage 4 -->
+          <g class="stage-node" data-stage="4" tabindex="0" role="button" transform="translate(510,55)">
+            <rect class="node-rect" width="120" height="70" rx="8" style="stroke:var(--backend);color:var(--backend)"></rect>
+            <text x="60" y="30" text-anchor="middle" class="node-label">Tally</text>
+            <text x="60" y="44" text-anchor="middle" class="node-sub">calls per symbol</text>
+          </g>
+          <!-- stage 5 -->
+          <g class="stage-node" data-stage="5" tabindex="0" role="button" transform="translate(660,55)">
+            <rect class="node-rect" width="150" height="70" rx="8" style="stroke:var(--messagebus);color:var(--messagebus)"></rect>
+            <text x="75" y="24" text-anchor="middle" class="node-label">Score complexity</text>
+            <text x="75" y="38" text-anchor="middle" class="node-sub">of the one call site</text>
+            <text x="75" y="50" text-anchor="middle" class="node-sub">(branches, not lines)</text>
+          </g>
+          <!-- stage 6 -->
+          <g class="stage-node" data-stage="6" tabindex="0" role="button" transform="translate(840,55)">
+            <rect class="node-rect" width="225" height="70" rx="8" style="stroke:var(--cloud);color:var(--cloud)"></rect>
+            <text x="112" y="24" text-anchor="middle" class="node-label">count==1 &amp;&amp; complexity≤15?</text>
+            <text x="112" y="42" text-anchor="middle" class="node-sub">report the finding</text>
+          </g>
+        </svg>
+
+        <div class="detail-card" id="d2-detail">
+          <span class="tag" style="background:var(--frontend);color:#031017">01</span>
+          <span>Click any stage above to see what it actually does, with the code behind it.</span>
+        </div>
+      </div>
+      <figcaption>Six stages, one pass over the package. No text matching — every count and complexity score comes from the type checker.</figcaption>
+    </figure>
+
+    <p>The whole analyzer is short enough to read in one sitting:</p>
+
+    <pre class="code"><span class="k">var</span> Analyzer = &amp;analysis.Analyzer{
+    Name: <span class="s">"singlecaller"</span>,
+    Doc:  <span class="s">"reports short, unexported funcs/methods called from exactly one site"</span>,
+    Run:  run,
+}
+
+<span class="c">// declared: every unexported FuncDecl short enough to matter.
+// counts: every *types.Func a CallExpr actually resolves to.
+// callerComplexity: the branch count of whichever function that
+// one call came from.</span>
+<span class="k">for</span> obj, d := <span class="k">range</span> declared {
+    <span class="k">if</span> counts[obj] != 1 {
+        <span class="k">continue</span>
+    }
+    <span class="k">if</span> cc := callerComplexity[obj]; cc &gt; maxCallerComplexity {
+        <span class="k">continue</span>
+    }
+    pass.Reportf(d.node.Pos(), <span class="s">"%s is called from a single site (call site complexity %d)"</span>, d.name, cc)
+}</pre>
+
+    <p>
+      Point the very first version — just "unexported, one caller, full
+      stop," no other rules — at even a small, otherwise unremarkable
+      service and it finds the exact bug that inspired it, plus a handful
+      of other things that are technically true and practically useless.
+      Here's a compact stand-in service — eight unexported functions, one
+      <code class="inline">main</code>/<code class="inline">run</code>
+      pair, a couple of HTTP handlers, a background loop — run through
+      that first, unrefined version:
+    </p>
+
+    <h2><span class="num">04</span>Eight hits, two of them obviously wrong</h2>
+
+    <pre class="code"><span class="c">entities.go:68:1:  customerFromFields is referenced from a single place
+service.go:29:1:   run is referenced from a single place
+service.go:91:1:   buildServer is referenced from a single place
+service.go:101:1:  newTimeoutSeconds is referenced from a single place
+service.go:112:1:  healthHandler is referenced from a single place
+service.go:125:1:  handleLogin is referenced from a single place
+service.go:134:1:  sanitizeRedirectPath is referenced from a single place
+service.go:144:1:  sweepExpired is referenced from a single place</span></pre>
+
+    <p>
+      Two of these are obviously wrong the moment you read them.
+      <code class="inline">run()</code> is referenced exactly once, from
+      <code class="inline">main()</code> — because that's what a
+      <code class="inline">main()</code> is for, not because it's a
+      pointless wrapper. <code class="inline">handleLogin</code> is
+      referenced exactly once too, but that reference is
+      <code class="inline">mux.HandleFunc("/login", handleLogin)</code> — a
+      bare value handed to a router, invoked later by the HTTP mux, not by
+      any line of code the analyzer could point at as "the one call site."
+      Flagging either isn't technically wrong — the naive version's rule
+      really is "one reference, full stop" — but it's useless. There's
+      nowhere sensible to inline a route handler <em>into</em>, and no
+      version of "inline <code class="inline">run()</code> into
+      <code class="inline">main()</code>" makes anything simpler.
+    </p>
+
+    <p>Two adjustments cut the noise.</p>
+
+    <p>
+      <strong>Only count direct calls.</strong> A reference used as a
+      value — passed to a router, handed to <code class="inline">go</code>
+      as an argument, stored in a struct field — isn't a call the tool can
+      reason about inlining. So the walk narrowed from "every identifier
+      that resolves to one of our declared functions" to "every
+      <code class="inline">*ast.CallExpr</code> whose callee resolves to
+      one of them." That alone drops
+      <code class="inline">handleLogin</code> — a bare reference — out of
+      the results, while correctly leaving
+      <code class="inline">healthHandler</code> in: its one reference is
+      <code class="inline">healthHandler(store)</code>, a real call that
+      produces the handler value, not a bare name.
+    </p>
+
+    <p>
+      <strong>Only flag short functions.</strong> A single-caller function
+      well over a page long is almost never the "just inline the struct
+      literal" pattern this tool is hunting — it's a deliberate readability
+      split, and inlining it would make the caller worse, not better. A
+      15-line ceiling (<code class="inline">maxInlinableLines</code> in
+      <code class="inline">main.go</code>) keeps the tool aimed at the
+      trivial-builder shape it's actually good at recognizing, and quiet
+      about <code class="inline">run()</code>, which is long enough on its
+      own to clear the bar regardless of how it's referenced.
+    </p>
+
+    <p>Same demo, same command, after both changes:</p>
+
+    <pre class="code"><span class="c">6 findings</span> — down from 8. run() dropped for being long; handleLogin dropped for being a value, not a call.</pre>
+
+    <h2><span class="num">05</span>Six findings, most of them fine</h2>
+
+    <p>
+      Six is a number you can actually read, one at a time, which is the
+      whole point — the tool's job is to shrink the list a human has to
+      look at, not to replace looking. Here's what the six turned out to
+      be:
+    </p>
+
+    <ul>
+      <li><code class="inline">customerFromFields</code> — the original bug. No independent meaning, one caller, nothing to reconcile. <strong>Should be inlined.</strong></li>
+      <li><code class="inline">newTimeoutSeconds</code> — four lines, an <code class="inline">if</code> on an environment string, no independent meaning whatsoever. <strong>Should be inlined.</strong></li>
+      <li><code class="inline">sanitizeRedirectPath</code> — an explicit open-redirect guard. Short, single-caller, and shaped exactly like the two functions above — but this one is worth keeping separate regardless of caller count, because burying a security check inline makes it harder to audit later.</li>
+      <li><code class="inline">sweepExpired</code> — a background loop launched with <code class="inline">go sweepExpired(...)</code>. Inlining a ticker-and-select loop into whatever launches it helps no one.</li>
+      <li><code class="inline">buildServer</code> — a small constructor. Reasonable either way, honestly — one caller, but a name that documents "this is where the server gets assembled" is worth something too.</li>
+      <li><code class="inline">healthHandler</code> — the standard Go "handler factory" pattern: called once, directly, to produce the closure the mux actually serves. Kept separate for route-table readability by convention, not by accident.</li>
+    </ul>
+
+    <p>
+      Two out of six. That ratio is the actual finding here, more than the
+      tool itself: a linter can point at candidates, but distinguishing
+      "nobody needed this" from "this is a named security check that
+      happens to have one caller" is squarely a human judgment call, every
+      time — <code class="inline">customerFromFields</code> and
+      <code class="inline">sanitizeRedirectPath</code> are the same shape
+      by every measure the tool takes (short, unexported, one direct
+      call), and only one of them should exist. The tool's heuristics —
+      direct calls only, short bodies only — get the list from eight to
+      six. They can't get it to two. Nothing short of understanding the
+      code can.
+    </p>
+
+    <div class="callout">
+      <span>💡</span>
+      <span><b>The takeaway isn't "write more precise heuristics."</b> It's that a tool like this is a search-space reducer, not a verdict machine — which is exactly why it's wired in as advice, not as a gate.</span>
+    </div>
+
+    <h2><span class="num">06</span>One more axis: how complex is where it lands</h2>
+
+    <p>
+      A fair question came up after this shipped: the tool judged whether
+      the <em>candidate</em> was short enough to bother inlining, but never
+      looked at how much was already going on wherever it would land. A
+      four-line helper is trivially inlinable into a five-line function.
+      It's a different proposition dropped into a function that's already
+      juggling a dozen branches — the result isn't simpler, it's just moved
+      the same complexity from a named place to an anonymous one.
+    </p>
+
+    <p>
+      The fix is the same shape as the first two refinements: measure
+      something cheap and structural, then use it as one more filter.
+      <code class="inline">go/analysis</code> already has the AST in hand,
+      so counting a function's cyclomatic complexity — one point for every
+      <code class="inline">if</code>, <code class="inline">for</code>,
+      non-default <code class="inline">case</code>,
+      <code class="inline">&amp;&amp;</code>, or
+      <code class="inline">||</code> — is about a dozen lines, the same
+      McCabe-style count tools like <code class="inline">gocyclo</code>
+      report.
+    </p>
+
+    <p>Run it against the same six survivors, complexity ceiling disabled just to see the numbers:</p>
+
+    <pre class="code"><span class="c">sweepExpired   — call site complexity 16  (run, the service's start/stop lifecycle)
+buildServer    — call site complexity 16  (run, same caller)
+healthHandler  — call site complexity 16  (run, same caller)
+sanitizeRedirectPath — call site complexity  1  (handleLogin)
+newTimeoutSeconds    — call site complexity  1  (buildServer)
+customerFromFields   — call site complexity  1  (GetCustomer)</span></pre>
+
+    <p>
+      One detail worth noticing before the ceiling even comes into it:
+      three of these six trace back to the exact same caller.
+      <code class="inline">run()</code> — the service's entire
+      start/stop lifecycle, with its config validation, its signal
+      handling, its shutdown sequence — is where all three land, so all
+      three inherit its complexity equally, whether they're a handler
+      factory, a background loop, or a constructor. One overloaded call
+      site retroactively puts every one of its direct calls under the
+      same scrutiny.
+    </p>
+
+    <p>
+      A ceiling of 15 — comfortably above what a clean, single-purpose
+      function should ever need — cuts all three
+      (<code class="inline">sweepExpired</code>,
+      <code class="inline">buildServer</code>,
+      <code class="inline">healthHandler</code>) out automatically. All
+      three were already on the "keep separate, or at least defensible"
+      side of the manual review above, for reasons this check knows
+      nothing about — a background loop, a named constructor, an
+      idiomatic handler factory. The complexity check didn't arrive at
+      that conclusion for those reasons. It arrived at the same
+      conclusion for a completely different one, which is the best a
+      second heuristic can really do: agree with judgment already made,
+      on cases nobody's looked at yet.
+    </p>
+
+    <pre class="code"><span class="c">3 findings</span> — down from 6, with zero additional human judgment spent on the three that left.</pre>
+
+    <div class="callout">
+      <span>💡</span>
+      <span>This doesn't undo the earlier point about heuristics not replacing judgment — <b>it adds a structural signal, not a smarter one.</b> "How branchy is the landing spot" is answerable straight from the AST; "does this deserve to be named" still isn't, and the tool still says nothing about the two of the final three that are worth acting on.</span>
+    </div>
+
+    <h2><span class="num">07</span>Advisory, everywhere it runs</h2>
+
+    <p>
+      Given that ratio, blocking anything on this check would be the wrong
+      call — it would either train people to silence a mostly-correct
+      tool, or worse, get people inlining security checks just to make CI
+      green. So it runs in three places, and none of them stop you:
+    </p>
+
+    <figure class="diagram">
+      <div class="diagram-panel">
+        <div class="diagram-head">
+          <span class="diagram-title">Where it runs</span>
+          <span class="diagram-hint">Hover a step for detail</span>
+        </div>
+        <svg class="diagram-svg" viewBox="0 0 980 160" role="img" aria-labelledby="d3-title d3-desc">
+          <title id="d3-title">The commit-to-merge path, with singlecaller running twice, neither time blocking</title>
+          <desc id="d3-desc">Local commit, then a pre-commit hook that warns but never blocks, then push, then a non-blocking CI step, then merge.</desc>
+          <defs>
+            <marker id="arrow3" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M0,0 L8,4 L0,8 z" fill="var(--dim)"></path>
+            </marker>
+          </defs>
+          <path class="edge" marker-end="url(#arrow3)" d="M155,80 L185,80"></path>
+          <path class="edge" marker-end="url(#arrow3)" d="M375,80 L405,80"></path>
+          <path class="edge" marker-end="url(#arrow3)" d="M575,80 L605,80"></path>
+          <path class="edge" marker-end="url(#arrow3)" d="M825,80 L855,80"></path>
+
+          <g transform="translate(15,50)">
+            <rect class="node-rect" width="140" height="60" rx="8" style="stroke:var(--external)"></rect>
+            <text x="70" y="28" text-anchor="middle" class="node-label">git commit</text>
+            <text x="70" y="42" text-anchor="middle" class="node-sub">local</text>
+          </g>
+
+          <g transform="translate(185,50)">
+            <rect class="node-rect" width="190" height="60" rx="8" stroke-dasharray="3 3" style="stroke:var(--cloud)"></rect>
+            <text x="95" y="24" text-anchor="middle" class="node-label">pre-commit hook</text>
+            <text x="95" y="38" text-anchor="middle" class="node-sub" style="fill:var(--cloud)">warns, never blocks</text>
+            <rect x="130" y="-8" width="58" height="14" rx="7" fill="var(--cloud)"></rect>
+            <text x="159" y="2" text-anchor="middle" class="pill" fill="#031017">advisory</text>
+          </g>
+
+          <g transform="translate(405,50)">
+            <rect class="node-rect" width="140" height="60" rx="8" style="stroke:var(--external)"></rect>
+            <text x="70" y="28" text-anchor="middle" class="node-label">git push</text>
+            <text x="70" y="42" text-anchor="middle" class="node-sub">to origin</text>
+          </g>
+
+          <g transform="translate(605,50)">
+            <rect class="node-rect" width="220" height="60" rx="8" stroke-dasharray="3 3" style="stroke:var(--cloud)"></rect>
+            <text x="110" y="24" text-anchor="middle" class="node-label">CI · lint job</text>
+            <text x="110" y="38" text-anchor="middle" class="node-sub" style="fill:var(--cloud)">continue-on-error: true</text>
+            <rect x="152" y="-8" width="82" height="14" rx="7" fill="var(--cloud)"></rect>
+            <text x="193" y="2" text-anchor="middle" class="pill" fill="#031017">non-blocking</text>
+          </g>
+
+          <g transform="translate(855,50)">
+            <rect class="node-rect" width="110" height="60" rx="8" style="stroke:var(--backend)"></rect>
+            <text x="55" y="28" text-anchor="middle" class="node-label">merge</text>
+            <text x="55" y="42" text-anchor="middle" class="node-sub" style="fill:var(--backend)">terminal</text>
+          </g>
+        </svg>
+        <div class="legend">
+          <div class="legend-item"><span class="legend-swatch" style="background:var(--external)"></span>Ordinary git flow</div>
+          <div class="legend-item"><span class="legend-swatch" style="background:var(--cloud)"></span>singlecaller runs (dashed = advisory)</div>
+          <div class="legend-item"><span class="legend-swatch" style="background:var(--backend)"></span>Terminal state</div>
+        </div>
+      </div>
+      <figcaption>Two chances to see a finding before merge. Zero chances for it to block one.</figcaption>
+    </figure>
+
+    <p>
+      This repo's own <code class="inline">.githooks/pre-commit</code> (set
+      up once with <code class="inline">git config core.hooksPath
+      .githooks</code>) skips entirely unless a staged file is a
+      <code class="inline">.go</code> file, so it costs nothing on a docs
+      commit. Its CI step runs with <code class="inline">continue-on-error:
+      true</code> — visible in every build log, blocking nothing. Both are
+      about a dozen lines; see <code class="inline">.githooks/pre-commit</code>
+      and <code class="inline">.github/workflows/ci.yml</code> at the repo
+      root.
+    </p>
+
+    <hr class="rule">
+
+    <p>
+      The whole arc fits in one sentence: a copy-pasted pattern that
+      quietly stopped making sense, a question about whether tooling could
+      have caught it, and a small analyzer that keeps answering a little
+      more precisely each time it's asked a follow-up — eight hits down to
+      six by only counting real calls and ignoring long functions, six
+      down to three by asking how complex the landing spot already is. On
+      a real, much larger codebase, expect all three numbers to be bigger
+      — but the shape of the narrowing, and the fact that a human still
+      reads whatever's left, doesn't change with scale. That narrowing is
+      the actual deliverable, not the tool itself. A linter that returns
+      eight or even six confident-sounding candidates teaches people to
+      ignore it; one that keeps shrinking the list, and stays honest that
+      a human reads whatever's left, gets to stick around.
+    </p>
+
+  </article>
+
+  <footer>
+    <p>Source, README, and the analyzer itself live next to this post — <a href="./README.md">README.md</a> · <a href="./analyzer.go">analyzer.go</a>.</p>
+    <p>Run it yourself: <code class="inline">go run github.com/nerd-zero/slopless-go/cmd/slopless-go@latest singlecaller ./...</code></p>
+  </footer>
+
+</div>
+
+<script>
+(function(){
+  "use strict";
+
+  // ---------- theme ----------
+  var root = document.documentElement;
+  var toggle = document.getElementById('themeToggle');
+  var icon = document.getElementById('themeIcon');
+  var label = document.getElementById('themeLabel');
+
+  function applyTheme(t){
+    if (t === 'light') { root.setAttribute('data-theme', 'light'); icon.textContent = '☀'; label.textContent = 'Light'; }
+    else { root.removeAttribute('data-theme'); icon.textContent = '☾'; label.textContent = 'Dark'; }
+  }
+  var stored = null;
+  try { stored = localStorage.getItem('singlecaller-theme'); } catch (e) {}
+  if (stored) {
+    applyTheme(stored);
+  } else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) {
+    applyTheme('light');
+  } else {
+    applyTheme('dark');
+  }
+  toggle.addEventListener('click', function(){
+    var next = root.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+    applyTheme(next);
+    try { localStorage.setItem('singlecaller-theme', next); } catch (e) {}
+  });
+
+  // ---------- diagram 1: click a helper to trace its callers ----------
+  var helpers = document.querySelectorAll('.helper-node');
+
+  function clearTrace(svg){
+    svg.querySelectorAll('.node-group, .helper-node, .edge').forEach(function(n){
+      n.classList.remove('dimmed');
+      n.classList.remove('traced');
+    });
+    helpers.forEach(function(h){ if (svg.contains(h)) h.setAttribute('aria-pressed', 'false'); });
+  }
+
+  helpers.forEach(function(h){
+    function trace(){
+      var svg = h.closest('svg');
+      var alreadyActive = h.getAttribute('aria-pressed') === 'true';
+      clearTrace(svg);
+      if (alreadyActive) return;
+
+      h.setAttribute('aria-pressed', 'true');
+      var group = h.id === 'helper-orders' ? 'orders' : 'customer';
+
+      // dim every node and edge in this diagram, then light up only the
+      // focused helper, its callers, and the edges between them — the
+      // same "trace upstream" shape Archify's Semantic Passport uses.
+      svg.querySelectorAll('.node-group, .helper-node, .edge').forEach(function(n){ n.classList.add('dimmed'); });
+      h.classList.remove('dimmed');
+
+      svg.querySelectorAll('[data-for="' + group + '"]').forEach(function(edge){
+        edge.classList.remove('dimmed');
+        edge.classList.add('traced');
+      });
+      var callerGroup = document.getElementById('d1-callers-' + group);
+      if (callerGroup) callerGroup.querySelectorAll('.node-group').forEach(function(n){
+        n.classList.remove('dimmed');
+        n.classList.add('traced');
+      });
+    }
+    h.addEventListener('click', trace);
+    h.addEventListener('keydown', function(ev){ if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); trace(); } });
+  });
+
+  // ---------- diagram 2: click a stage to inspect it ----------
+  var stageInfo = {
+    '1': { tag:'01', color:'var(--frontend)', text:'Walks every top-level FuncDecl in hand-written files (generated ones are skipped by file, not by function) and records the unexported ones as candidates.', code:'obj, _ := pass.TypesInfo.Defs[fd.Name].(*types.Func)' },
+    '2': { tag:'02', color:'var(--security)', text:'Drops init, main, anything over 15 lines, and — separately — anything declared in a "Code generated ... DO NOT EDIT" file. What is left is the pool of realistically inlinable helpers.', code:'if lineCount(pass, fd) > maxInlinableLines { continue }' },
+    '3': { tag:'03', color:'var(--backend)', text:'Inspects every ast.CallExpr in every file (generated files included — a generated caller still counts), and resolves the callee through the type checker rather than matching names as text.', code:'obj, ok := pass.TypesInfo.Uses[ident].(*types.Func)' },
+    '4': { tag:'04', color:'var(--backend)', text:'One map, one increment per resolved call. A function referenced but never actually called — passed to a router, handed to go as a value — never reaches this tally at all.', code:'counts[obj]++' },
+    '5': { tag:'05', color:'var(--messagebus)', text:'For the one call site a surviving candidate has, walks its enclosing function and counts branch points — if/for/range/non-default case/&&/|| — the same McCabe-style count tools like gocyclo report.', code:'cyclomaticComplexity(caller)' },
+    '6': { tag:'06', color:'var(--cloud)', text:'A candidate is only reported when it has exactly one call site AND that site isn’t already past the complexity ceiling — inlining into an already-branchy function relocates complexity rather than removing it.', code:'if counts[obj]==1 && cc<=maxCallerComplexity { report }' }
+  };
+  var stages = document.querySelectorAll('.stage-node');
+  var detail = document.getElementById('d2-detail');
+  function selectStage(stage){
+    stages.forEach(function(s){ s.classList.toggle('active', s.getAttribute('data-stage') === stage); });
+    var info = stageInfo[stage];
+    if (!info) return;
+    detail.innerHTML = '<span class="tag" style="background:' + info.color + ';color:#031017">' + info.tag + '</span>' +
+      '<span>' + info.text + ' <code>' + info.code + '</code></span>';
+  }
+  stages.forEach(function(s){
+    var stage = s.getAttribute('data-stage');
+    s.addEventListener('click', function(){ selectStage(stage); });
+    s.addEventListener('keydown', function(ev){ if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); selectStage(stage); } });
+  });
+})();
+</script>
+
+</body>
+</html>
