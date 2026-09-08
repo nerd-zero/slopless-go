@@ -25,6 +25,7 @@ import (
 	"golang.org/x/tools/go/analysis/multichecker"
 	"golang.org/x/tools/go/analysis/singlechecker"
 
+	"github.com/nerd-zero/slopless-go/duphelper"
 	"github.com/nerd-zero/slopless-go/singlecaller"
 )
 
@@ -32,6 +33,7 @@ import (
 // here to make it available as both "slopless-go <name>" and part of "all".
 var registry = map[string]*analysis.Analyzer{
 	"singlecaller": singlecaller.Analyzer,
+	"duphelper":    duphelper.Analyzer,
 }
 
 func main() {
