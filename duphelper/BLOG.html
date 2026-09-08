@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Helper You Already Had</title>
+<meta name="description" content="A pointer-of helper got rewritten under a new name instead of reused, twice in one review — and what building a mechanical duplicate-finder for it taught us about alpha-equivalence.">
+<style>
+  /* ============================================================
+     Design tokens — same palette as singlecaller/BLOG.html, lifted
+     from Archify's design system. Dark-first; light mode preserves
+     category identity and priority.
+     https://github.com/tt-a1i/archify
+     ============================================================ */
+  :root{
+    --canvas:#020617; --mask:#0F172A; --ink:#FFFFFF;
+    --muted:#94A3B8; --dim:#475569; --border:#1E293B;
+    --frontend:#22D3EE; --backend:#34D399; --database:#A78BFA;
+    --cloud:#FBBF24; --security:#FB7185; --messagebus:#FB923C;
+    --external:#94A3B8;
+
+    --r-precise:0.2rem; --r-control:0.5rem; --r-panel:1rem; --r-pill:999px;
+    --sp-xs:0.25rem; --sp-sm:0.5rem; --sp-md:0.75rem; --sp-lg:1rem; --sp-xl:1.5rem; --sp-page:2rem;
+
+    --shadow-lift:0 28px 80px rgba(0,0,0,.34);
+    --shadow-panel:0 18px 48px rgba(0,0,0,.30);
+    --t-fast:160ms ease;
+
+    --font-mono:'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --font-sans:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+
+    --page-bg:#08111F; --page-panel:#0D1729; --page-border:#1C2A40;
+    --page-ink:#E8EEF7; --page-muted:#8FA2BC; --page-accent:var(--frontend);
+  }
+  [data-theme="light"]{
+    --canvas:#F1F5F9; --mask:#FFFFFF; --ink:#0F172A;
+    --muted:#475569; --dim:#94A3B8; --border:#CBD5E1;
+    --frontend:#0891B2; --backend:#059669; --database:#7C3AED;
+    --cloud:#B45309; --security:#E11D48; --messagebus:#C2410C;
+    --external:#64748B;
+
+    --shadow-lift:0 20px 48px rgba(15,23,42,.12);
+    --shadow-panel:0 12px 28px rgba(15,23,42,.10);
+
+    --page-bg:#F8FAFC; --page-panel:#FFFFFF; --page-border:#E2E8F0;
+    --page-ink:#0F172A; --page-muted:#51617A; --page-accent:var(--frontend);
+  }
+  @media (prefers-reduced-motion: reduce){
+    *{ transition-duration:0.001ms !important; animation-duration:0.001ms !important; }
+  }
+
+  *{ box-sizing:border-box; }
+  html{ scroll-behavior:smooth; }
+  body{
+    margin:0; background:var(--page-bg); color:var(--page-ink);
+    font-family:var(--font-sans); line-height:1.65;
+    -webkit-font-smoothing:antialiased;
+  }
+  ::selection{ background:var(--page-accent); color:#031017; }
+  a{ color:var(--page-accent); }
+
+  .wrap{ max-width:760px; margin:0 auto; padding:0 var(--sp-page) 6rem; }
+
+  .topbar{
+    position:sticky; top:0; z-index:20;
+    display:flex; align-items:center; justify-content:space-between;
+    padding:var(--sp-md) var(--sp-page);
+    background:color-mix(in srgb, var(--page-bg) 88%, transparent);
+    backdrop-filter:blur(10px);
+    border-bottom:1px solid var(--page-border);
+  }
+  .topbar .brand{
+    font-family:var(--font-mono); font-weight:700; font-size:0.75rem;
+    letter-spacing:0.12em; text-transform:uppercase; color:var(--page-muted);
+  }
+  .theme-toggle{
+    display:inline-flex; align-items:center; gap:var(--sp-sm);
+    background:var(--page-panel); color:var(--page-ink);
+    border:1px solid var(--page-border); border-radius:var(--r-pill);
+    font-family:var(--font-mono); font-size:0.7rem; font-weight:600;
+    padding:0.4rem 0.85rem; cursor:pointer; transition:border-color var(--t-fast), background var(--t-fast);
+  }
+  .theme-toggle:hover{ border-color:var(--page-accent); }
+  .theme-toggle:focus-visible{ outline:2px solid var(--page-accent); outline-offset:2px; }
+
+  .hero{ padding:4rem 0 2rem; }
+  .eyebrow{
+    font-family:var(--font-mono); font-size:0.625rem; font-weight:700;
+    letter-spacing:0.12em; text-transform:uppercase; color:var(--page-accent);
+    display:flex; align-items:center; gap:0.6rem; margin-bottom:1rem;
+  }
+  .eyebrow::before{ content:""; width:1.5rem; height:1px; background:var(--page-accent); }
+  h1{
+    font-family:var(--font-mono); font-size:clamp(2rem, 5vw, 2.75rem); font-weight:700;
+    line-height:1.15; letter-spacing:-0.025em; margin:0 0 1rem;
+  }
+  .dek{ font-size:1.15rem; color:var(--page-muted); max-width:56ch; margin:0 0 1.5rem; }
+  .byline{
+    display:flex; gap:1rem; align-items:center; flex-wrap:wrap;
+    font-family:var(--font-mono); font-size:0.75rem; color:var(--page-muted);
+    padding-top:1.25rem; border-top:1px solid var(--page-border);
+  }
+  .byline .dot{ opacity:0.5; }
+
+  article h2{
+    font-family:var(--font-mono); font-size:1.4rem; font-weight:700;
+    letter-spacing:-0.01em; margin:3.25rem 0 1rem;
+  }
+  article h2 .num{ color:var(--page-accent); margin-right:0.5rem; }
+  article p{ font-size:1.02rem; color:var(--page-ink); margin:1.1rem 0; }
+  article p.lede{ font-size:1.12rem; color:var(--page-ink); }
+  article ul, article ol{ padding-left:1.3rem; }
+  article li{ margin:0.5rem 0; }
+  article strong{ color:var(--page-ink); }
+  code.inline{
+    font-family:var(--font-mono); font-size:0.87em; background:var(--page-panel);
+    border:1px solid var(--page-border); border-radius:var(--r-precise);
+    padding:0.1em 0.4em;
+  }
+  blockquote{
+    margin:1.75rem 0; padding:0.25rem 0 0.25rem 1.25rem;
+    border-left:3px solid var(--page-accent);
+    color:var(--page-muted); font-size:1.05rem; font-style:italic;
+  }
+  pre.code{
+    font-family:var(--font-mono); font-size:0.8rem; line-height:1.6;
+    background:var(--page-panel); border:1px solid var(--page-border);
+    border-radius:var(--r-control); padding:1rem 1.1rem; overflow-x:auto;
+    margin:1.5rem 0;
+  }
+  pre.code .k{ color:var(--database); }
+  pre.code .s{ color:var(--backend); }
+  pre.code .c{ color:var(--page-muted); font-style:italic; }
+  pre.code .fn{ color:var(--frontend); }
+
+  .callout{
+    display:flex; gap:0.9rem; align-items:flex-start;
+    background:var(--page-panel); border:1px solid var(--page-border);
+    border-left:3px solid var(--cloud);
+    border-radius:var(--r-control); padding:1rem 1.2rem; margin:1.75rem 0;
+    font-size:0.95rem; color:var(--page-muted);
+  }
+  .callout b{ color:var(--page-ink); }
+
+  hr.rule{ border:none; border-top:1px solid var(--page-border); margin:3.5rem 0; }
+
+  footer{
+    font-family:var(--font-mono); font-size:0.8rem; color:var(--page-muted);
+    padding-top:2rem; border-top:1px solid var(--page-border);
+  }
+  footer a{ color:var(--page-ink); }
+  footer p{ margin:0.5rem 0; }
+
+  /* ---------- embedded Archify diagram panel ---------- */
+  figure.diagram{ margin:2rem -1rem 1rem; }
+  .diagram-panel{
+    background:var(--mask); border:1px solid var(--border);
+    border-radius:var(--r-panel); box-shadow:var(--shadow-lift);
+    padding:var(--sp-lg); color:var(--ink);
+  }
+  .diagram-head{
+    display:flex; justify-content:space-between; align-items:baseline;
+    gap:1rem; margin-bottom:var(--sp-md); flex-wrap:wrap;
+  }
+  .diagram-title{ font-family:var(--font-mono); font-size:0.875rem; font-weight:600; }
+  .diagram-open{
+    font-family:var(--font-mono); font-size:0.625rem; font-weight:700; letter-spacing:0.1em;
+    text-transform:uppercase; color:var(--page-accent);
+  }
+  .diagram-frame{
+    display:block; width:100%; height:640px; border:0; border-radius:var(--r-control);
+    background:var(--canvas);
+  }
+  figcaption{
+    font-family:var(--font-sans); font-size:0.85rem; color:var(--page-muted);
+    text-align:center; padding:0 1rem; margin-top:0.75rem;
+  }
+
+  @media (max-width:640px){
+    .wrap{ padding:0 1.1rem 4rem; }
+    .diagram-panel{ padding:1rem; border-radius:var(--r-control); }
+    figure.diagram{ margin-left:0; margin-right:0; }
+    .diagram-frame{ height:480px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <span class="brand">api/tools/duphelper</span>
+  <button class="theme-toggle" id="themeToggle" type="button" aria-label="Toggle color theme">
+    <span id="themeIcon">☾</span> <span id="themeLabel">Dark</span>
+  </button>
+</div>
+
+<div class="wrap">
+
+  <header class="hero">
+    <div class="eyebrow">Engineering notes</div>
+    <h1>The Helper You Already Had</h1>
+    <p class="dek">
+      A one-line pointer-of helper got rewritten under a new name in a
+      sibling file, in the same package, where the original was already
+      sitting — twice in one review. Neither <code class="inline">gofmt</code>
+      nor <code class="inline">go vet</code> nor staticcheck has anything to
+      say about it, because nothing about either declaration is individually
+      wrong. The problem only exists in the relationship between the two.
+    </p>
+    <div class="byline">
+      <span>slopless-go</span>
+      <span class="dot">·</span>
+      <span>duphelper</span>
+      <span class="dot">·</span>
+      <span>go/analysis</span>
+    </div>
+  </header>
+
+  <article>
+
+    <p class="lede">
+      It looked like this. A test file needed a way to turn a
+      <code class="inline">float64</code> into a
+      <code class="inline">*float64</code> for a fixture field:
+    </p>
+
+    <pre class="code"><span class="k">func</span> <span class="fn">ptrFloat64Widget</span>(w <span class="k">float64</span>) *<span class="k">float64</span> { <span class="k">return</span> &amp;w }</pre>
+
+    <p>
+      Reasonable-looking code, in isolation. The problem is that a sibling
+      file in the exact same package already had this:
+    </p>
+
+    <pre class="code"><span class="k">func</span> <span class="fn">ptrFloat64</span>(v <span class="k">float64</span>) *<span class="k">float64</span> { <span class="k">return</span> &amp;v }</pre>
+
+    <p>
+      Same signature, once you look past the parameter's name. Same body,
+      once you look past the local variable's name. One of these two
+      declarations does nothing the other doesn't already do — most likely
+      it was added to dodge a
+      <code class="inline">ptrFloat64 redeclared in this block</code>
+      compiler error, or simply because the existing one wasn't noticed two
+      files over.
+    </p>
+
+    <h2><span class="num">01</span>Why nothing else catches this</h2>
+
+    <p>
+      Static duplication is boring to look for by hand and easy for a
+      linter to get wrong. Token-clone detectors (the <code class="inline">dupl</code>
+      family) hunt for *similar* blocks anywhere in a file, tuned with a
+      token-count threshold — useful for flagging a copy-pasted 40-line
+      method, noisy on anything smaller, and blind to the specific thing
+      that makes this case actionable: the two declarations are
+      <strong>structurally identical, in the same package</strong>, which
+      means one of them can just be deleted. That's a much narrower, much
+      more confident claim than "these two blocks look alike."
+    </p>
+
+    <p>
+      duphelper is built for exactly that narrower claim. It walks every
+      hand-written top-level function in a package, and for each pair whose
+      <strong>signature matches by type</strong> (parameter and result names
+      ignored) and whose <strong>body is alpha-equivalent</strong> (identical
+      once every local is replaced by a position-keyed placeholder instead of
+      its literal name), it reports the later one, pointing back at the
+      first.
+    </p>
+
+    <figure class="diagram">
+      <div class="diagram-panel">
+        <div class="diagram-head">
+          <span class="diagram-title">How duphelper finds a duplicate</span>
+          <a class="diagram-open" href="./diagram.html" target="_blank" rel="noopener">Open standalone ↗</a>
+        </div>
+        <iframe class="diagram-frame" src="./diagram.html" title="duphelper analysis pipeline diagram" loading="lazy"></iframe>
+      </div>
+      <figcaption>Generated with <a href="https://tt-a1i.github.io/archify/" target="_blank" rel="noopener">Archify</a> from <a href="./diagram.workflow.json">diagram.workflow.json</a> — interactive in the frame above, or open it standalone.</figcaption>
+    </figure>
+
+    <h2><span class="num">02</span>Position, not order</h2>
+
+    <p>
+      The first version of this compared bodies by renaming each local to a
+      placeholder in the order it was first <em>read</em>. That's wrong, and
+      it took a second, deliberately adversarial pair of test functions to
+      see why:
+    </p>
+
+    <pre class="code"><span class="k">func</span> <span class="fn">clampLow</span>(a, b <span class="k">int</span>) <span class="k">int</span> {
+    <span class="k">if</span> a &lt; b {
+        <span class="k">return</span> a
+    }
+    <span class="k">return</span> b
+}
+
+<span class="k">func</span> <span class="fn">clampHigh</span>(a, b <span class="k">int</span>) <span class="k">int</span> {
+    <span class="k">if</span> a &lt; b {
+        <span class="k">return</span> b
+    }
+    <span class="k">return</span> a
+}</pre>
+
+    <p>
+      Renamed by first-use order, both bodies read identically: "compare the
+      first-seen local against the second-seen local; branch returns the
+      first-seen one; fallthrough returns the second-seen one." The two
+      functions compute genuinely different things — one clamps low, one
+      clamps high — but a first-use renaming scheme can't see that, because
+      it never distinguishes <em>which parameter</em> a placeholder stands
+      for, only which one got mentioned first.
+    </p>
+
+    <p>
+      The fix: bind parameters and named results to their placeholders by
+      <strong>declared position</strong>, before the body is walked at all —
+      <code class="inline">a</code> is always the first placeholder,
+      <code class="inline">b</code> always the second, regardless of which
+      one either function happens to read first. Only after that binding is
+      fixed does the body get walked, and any *further* local — a
+      <code class="inline">:=</code>, a <code class="inline">var</code>, a
+      range variable — gets the next placeholder in the order it's first
+      declared. <code class="inline">clampLow</code> and
+      <code class="inline">clampHigh</code> now render to two different
+      strings, and stay uncollapsed.
+    </p>
+
+    <div class="callout">
+      <span>☝</span>
+      <span><b>Every finding is a candidate, not a verdict.</b> A short, identical-looking pair can still be intentional, and duphelper doesn't know why a function was split out any more than a human skimming a diff does. What it buys you is not having to notice the pair exists in the first place.</span>
+    </div>
+
+    <h2><span class="num">03</span>Where it stops looking</h2>
+
+    <p>
+      It's a single-package pass, so the most common real miss is the
+      cross-package case: a private reimplementation of something that
+      already exists as an <em>exported</em> helper in an imported
+      <code class="inline">helpers</code> package. Catching that would mean
+      exporting a fingerprint as an <code class="inline">analysis.Fact</code>
+      along the import graph — a real extension, not attempted in this first
+      pass. Methods and generic functions are left alone too, for the same
+      reason singlecaller leaves exported symbols alone: comparing them
+      correctly needs more context than a single package gives you.
+    </p>
+
+  </article>
+
+  <footer>
+    <p>Source, README, and the analyzer itself live next to this post — <a href="./README.md">README.md</a> · <a href="./analyzer.go">analyzer.go</a>.</p>
+    <p>Run it yourself: <code class="inline">go run github.com/nerd-zero/slopless-go/cmd/slopless-go@latest duphelper ./...</code></p>
+  </footer>
+
+</div>
+
+<script>
+(function(){
+  "use strict";
+  var root = document.documentElement;
+  var toggle = document.getElementById('themeToggle');
+  var icon = document.getElementById('themeIcon');
+  var label = document.getElementById('themeLabel');
+
+  function applyTheme(t){
+    if (t === 'light') { root.setAttribute('data-theme', 'light'); icon.textContent = '☀'; label.textContent = 'Light'; }
+    else { root.removeAttribute('data-theme'); icon.textContent = '☾'; label.textContent = 'Dark'; }
+  }
+  var stored = null;
+  try { stored = localStorage.getItem('duphelper-theme'); } catch (e) {}
+  if (stored) {
+    applyTheme(stored);
+  } else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) {
+    applyTheme('light');
+  } else {
+    applyTheme('dark');
+  }
+  toggle.addEventListener('click', function(){
+    var next = root.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+    applyTheme(next);
+    try { localStorage.setItem('duphelper-theme', next); } catch (e) {}
+  });
+})();
+</script>
+
+</body>
+</html>

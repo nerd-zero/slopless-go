@@ -12,7 +12,10 @@ bodied one got added under a different name — most likely to dodge a
 "redeclared in this block" compile error, or simply because the existing one
 wasn't found. `gofmt`/`go vet`/staticcheck don't catch this: nothing about
 either declaration is individually wrong, the problem only exists in the
-*relationship* between the two.
+*relationship* between the two. See [`BLOG.html`](./BLOG.html) for the full
+story — including the adversarial `clampLow`/`clampHigh` pair that forced
+locals to be bound by declared position rather than order of first use, and
+an interactive diagram of the analysis pipeline.
 
 ## What it flags
 

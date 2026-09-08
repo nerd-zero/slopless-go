@@ -44,7 +44,7 @@ go vet -vettool=/tmp/slopless-go ./...
 | Tool | Flags it as | Docs |
 |---|---|---|
 | [`singlecaller`](singlecaller) | A short, unexported func/method called from exactly one, uncomplicated call site — usually a sign a helper was copied from a pattern that stopped applying. | [README](singlecaller/README.md) · [the story behind it](singlecaller/BLOG.html) |
-| [`duphelper`](duphelper) | A top-level function whose signature and body are structurally identical to another one already declared in the same package — usually a duplicate written without noticing (or to dodge a redeclaration error). | [README](duphelper/README.md) |
+| [`duphelper`](duphelper) | A top-level function whose signature and body are structurally identical to another one already declared in the same package — usually a duplicate written without noticing (or to dodge a redeclaration error). | [README](duphelper/README.md) · [the story behind it](duphelper/BLOG.html) |
 
 ## Adding a new tool
 
