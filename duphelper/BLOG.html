@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>The Helper You Already Had</title>
-<meta name="description" content="A pointer-of helper got rewritten under a new name instead of reused, twice in one review — and what building a mechanical duplicate-finder for it taught us about alpha-equivalence.">
+<meta name="description" content="A pointer-of helper got rewritten under a new name instead of reused, twice in one review — and what building a mechanical duplicate-finder for it taught us, first about alpha-equivalence and then about why comparing SSA form beats comparing syntax.">
 <style>
   /* ============================================================
      Design tokens — same palette as singlecaller/BLOG.html, lifted
@@ -260,10 +260,10 @@
       duphelper is built for exactly that narrower claim. It walks every
       hand-written top-level function in a package, and for each pair whose
       <strong>signature matches by type</strong> (parameter and result names
-      ignored) and whose <strong>body is alpha-equivalent</strong> (identical
-      once every local is replaced by a position-keyed placeholder instead of
-      its literal name), it reports the later one, pointing back at the
-      first.
+      ignored) and whose <strong>compiled control flow graph matches</strong>
+      (identical once every local is replaced by a position-keyed
+      placeholder instead of its literal name), it reports the later one,
+      pointing back at the first.
     </p>
 
     <figure class="diagram">
@@ -329,7 +329,88 @@
       <span><b>Every finding is a candidate, not a verdict.</b> A short, identical-looking pair can still be intentional, and duphelper doesn't know why a function was split out any more than a human skimming a diff does. What it buys you is not having to notice the pair exists in the first place.</span>
     </div>
 
-    <h2><span class="num">03</span>Where it stops looking</h2>
+    <h2><span class="num">03</span>Syntax lies, SSA doesn't</h2>
+
+    <p>
+      The version above compared <em>syntax trees</em>: parse each function,
+      walk its AST, and render it to a canonical string. That's exactly
+      right for a copy-pasted function — the two trees really are the same
+      shape — but it has a blind spot. Two functions that do the same work
+      via different Go <em>constructs</em> have different trees, full stop.
+      A <code class="inline">for</code> loop is a different statement kind
+      from a <code class="inline">for</code> loop written as a condition
+      with the counter declared outside it. No amount of alpha-renaming
+      makes those two trees equal, even when they compute the identical
+      thing.
+    </p>
+
+    <p>
+      So duphelper doesn't compare trees anymore. It compares each
+      function's <strong>SSA form</strong> — the same static single
+      assignment intermediate representation
+      <a href="https://pkg.go.dev/golang.org/x/tools/go/ssa" target="_blank" rel="noopener">golang.org/x/tools/go/ssa</a>
+      builds for real analysis tools — and specifically the
+      <strong>control flow graph</strong> that falls out of it: which basic
+      blocks exist, what each one computes, and which blocks it can branch
+      to. Building SSA strips the syntax away. These two functions are
+      different statement kinds in the AST:
+    </p>
+
+    <pre class="code"><span class="k">func</span> <span class="fn">firstNegativeWhile</span>(nums []<span class="k">int</span>) <span class="k">int</span> {
+    i := 0
+    <span class="k">for</span> i &lt; len(nums) {
+        <span class="k">if</span> nums[i] &lt; 0 {
+            <span class="k">return</span> nums[i]
+        }
+        i++
+    }
+    <span class="k">return</span> -1
+}
+
+<span class="k">func</span> <span class="fn">firstNegativeCountingFor</span>(nums []<span class="k">int</span>) <span class="k">int</span> {
+    <span class="k">for</span> i := 0; i &lt; len(nums); i++ {
+        <span class="k">if</span> nums[i] &lt; 0 {
+            <span class="k">return</span> nums[i]
+        }
+    }
+    <span class="k">return</span> -1
+}</pre>
+
+    <p>
+      — a while-style loop against a three-clause counting loop — but once
+      built, both compile to the same four basic blocks doing the same
+      operations in the same order: load the length, compare, branch on the
+      negativity check, index, increment, jump back. duphelper's canonical
+      walk of that graph renders identically for both, and reports the
+      second as a duplicate of the first. The AST-based version could never
+      have found this pair — they don't share a single statement kind.
+    </p>
+
+    <p>
+      The same rebuild also normalizes constants for free: <code class="inline">0xA</code>
+      and <code class="inline">10</code> are different tokens in source, but
+      the same <code class="inline">go/constant.Value</code> once compiled,
+      so a function that returns one and a function that returns the other
+      now match too — a side effect of comparing compiled form that syntax
+      comparison could never have gotten right without hand-rolling its own
+      numeric-literal normalizer.
+    </p>
+
+    <p>
+      It's not a magic fix for <em>any</em> rewrite, though. The traversal
+      that walks each function's blocks follows real control-flow semantics
+      — an <code class="inline">if</code>'s first successor is always its
+      true branch — rather than trying every possible relabeling, which is
+      what a general graph-isomorphism search would do. That keeps the
+      comparison a linear walk instead of an expensive search, and it never
+      produces a false match, because the walk order is never arbitrary.
+      What it costs is symmetry: invert a condition and swap its two
+      branches, and the rewritten function walks differently and won't
+      match its original, even though it behaves identically. A missed
+      finding, same as before — never a false one.
+    </p>
+
+    <h2><span class="num">04</span>Where it stops looking</h2>
 
     <p>
       It's a single-package pass, so the most common real miss is the
