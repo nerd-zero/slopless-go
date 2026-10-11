@@ -17,28 +17,57 @@
 //     match; `func(v float64) *float64` and `func(v float32) *float64` do
 //     not, and neither does a different result count or a differing
 //     variadic-ness.
-//  3. Their bodies are alpha-equivalent: statement-for-statement and
-//     expression-for-expression identical once every local — parameters,
-//     named results, and anything declared inside the body (:=, var, a
-//     range/type-switch variable, a nested closure's own parameters) — is
-//     replaced by a placeholder keyed to its *binding position* (parameters
-//     and named results first, left to right, exactly as the signature
-//     check already lines them up; then body-declared locals in the order
-//     they're first bound) rather than its literal name. Binding position
-//     — not order of first use in the body — is what parameters are keyed
-//     on, because a function can read its parameters in any order: without
-//     this, `func(a, b int) int { return a - b }` and
-//     `func(a, b int) int { return b - a }` would wrongly canonicalize the
-//     same way (both would bind whichever operand appears textually first
-//     to the first placeholder), silently flattening a real behavioral
-//     difference into a false "duplicate."
-//     Anything that is NOT local — a package-level name, an imported
-//     identifier, a struct field or method selector, a literal's exact
-//     value — must still match exactly. Two functions with the same shape
-//     that read different globals, call different things, or return
-//     different constants are not duplicates.
+//  3. Their bodies produce the same control flow graph, once each is
+//     compiled to SSA (static single assignment) form — see below.
 //
-// Comments never affect the comparison.
+// # Why SSA instead of syntax
+//
+// An earlier version of this tool compared the *syntax tree* of each
+// function body, alpha-renaming locals to placeholders. That catches a
+// renamed-copy-paste, but nothing else: a `for` loop and an equivalent
+// `for range` loop are different syntax trees, so two functions that do
+// the same work via different Go control-flow constructs looked unrelated
+// to it, even though they compile down to the same machine behavior.
+//
+// This version instead builds each candidate function's SSA form — via
+// golang.org/x/tools/go/ssa, the same intermediate representation
+// go/analysis-based tools like staticcheck build on — and compares the
+// resulting control flow graphs. SSA construction strips away syntax
+// sugar: a counting `for` loop and a `for range` loop over the same
+// collection, doing the same work per element, generally lower to the
+// same sequence of blocks and instructions, so this version can catch
+// them as duplicates where the syntax-tree version could not. It also
+// normalizes constants: `0xA` and `10` are different literals in source
+// but the same SSA constant, so functions differing only in how a literal
+// was spelled now match too.
+//
+// The comparison walks each function's basic blocks and instructions in a
+// deterministic order — a depth-first traversal from the entry block,
+// following each block's successors in the order go/ssa recorded them
+// (which is semantically meaningful: for an `If`, the first successor is
+// always the true branch) — and renders that walk to a string. Every
+// locally-defined value (a parameter, a free variable of a closure, or the
+// result of an instruction) prints as a placeholder keyed to the position
+// it's first bound in that traversal, exactly as the old syntax-based
+// version keyed locals to their binding position rather than their name.
+// Anything that isn't local — a call to a package-level function, a
+// reference to a global, a field index, an operator, a type — must still
+// match exactly.
+//
+// Two functions match when their rendered strings are identical. This is
+// a *canonical-form* comparison, not general graph isomorphism: general
+// graph isomorphism is expensive to compute and, for arbitrary graphs, not
+// known to be solvable in polynomial time. Comparing canonical forms
+// avoids that cost — it's a linear walk of each function — at the cost of
+// occasionally missing a match that a full isomorphism search would find
+// (see Known limitations). It never produces a false match: the
+// traversal order is derived from real control-flow semantics (which
+// branch is "true", which block is the loop header), not an arbitrary
+// tie-break, so two functions that render identically really do run the
+// same operations in the same order along every path.
+//
+// Comments never affect the comparison (they were never part of the AST
+// comparison either, and SSA doesn't retain them at all).
 //
 // # Known limitations
 //
@@ -53,10 +82,13 @@
 //     that already exists as an *exported* helper in an imported package
 //     (the "we already have a helpers package for this" case) isn't caught
 //     — only two declarations sitting in the same package are compared.
-//   - Labels (goto targets) are compared by their literal text, not
-//     alpha-renamed. Two functions that are otherwise identical but use
-//     differently-named labels for the same control flow won't match — a
-//     missed finding, never a false one.
+//   - The traversal order is fixed by each block's successor order, which
+//     is meaningful (true-branch-first for an `If`) but not symmetric: two
+//     functions that are otherwise identical but swap which branch does
+//     which — `if a { x() } else { y() }` versus the same code with the
+//     condition inverted and the branches swapped — render differently and
+//     won't match, even though they behave identically. A missed finding,
+//     never a false one.
 //   - A function with an empty body (no statements) is never a candidate —
 //     matching stubs aren't an interesting finding.
 //
@@ -67,19 +99,20 @@ package duphelper
 import (
 	"fmt"
 	"go/ast"
-	"go/token"
 	"go/types"
-	"reflect"
 	"sort"
 	"strings"
 
 	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/go/analysis/passes/buildssa"
+	"golang.org/x/tools/go/ssa"
 )
 
 var Analyzer = &analysis.Analyzer{
-	Name: "duphelper",
-	Doc:  "reports top-level functions structurally identical to another function already declared in the same package",
-	Run:  run,
+	Name:     "duphelper",
+	Doc:      "reports top-level functions structurally identical to another function already declared in the same package",
+	Requires: []*analysis.Analyzer{buildssa.Analyzer},
+	Run:      run,
 }
 
 type candidate struct {
@@ -88,6 +121,8 @@ type candidate struct {
 }
 
 func run(pass *analysis.Pass) (any, error) {
+	ssaInput := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
+
 	// Only hand-written files contribute candidates — a generated file is
 	// never the one you'd edit to remove a duplicate from, so flagging one
 	// (or comparing two generated duplicates against each other) is just
@@ -110,7 +145,11 @@ func run(pass *analysis.Pass) (any, error) {
 			if !ok || (sig.TypeParams() != nil && sig.TypeParams().Len() > 0) {
 				continue
 			}
-			key := signatureKey(pass, sig) + "\x00" + canonicalBody(pass, fd)
+			fn := ssaInput.Pkg.Prog.FuncValue(obj)
+			if fn == nil || len(fn.Blocks) == 0 {
+				continue // no SSA body to compare (shouldn't happen for a non-empty, non-generic free function)
+			}
+			key := signatureKey(pass, sig) + "\x00" + canonicalSSA(pass, fn)
 			groups[key] = append(groups[key], candidate{fd: fd, name: fd.Name.Name})
 		}
 	}
@@ -158,161 +197,321 @@ func signatureKey(pass *analysis.Pass, sig *types.Signature) string {
 	return fmt.Sprintf("params:%s|variadic:%v|results:%s", tuple(sig.Params()), sig.Variadic(), tuple(sig.Results()))
 }
 
-// canonicalizer renders one function body to an alpha-equivalence-normalized
-// string: every local identifier prints as a positional placeholder, every
-// non-local identifier prints as its literal name, and every other node
-// prints by structurally walking its fields via reflection — so no AST node
-// kind needs its own hand-written case here.
-type canonicalizer struct {
-	pass   *analysis.Pass
-	fd     *ast.FuncDecl
-	locals map[types.Object]string
+// ssaCanon renders one function's SSA control flow graph to a canonical
+// string: every locally-defined value (parameter, free variable, or
+// instruction result) prints as a placeholder keyed to the position it's
+// first bound in a deterministic traversal, and every basic block prints
+// as a placeholder keyed to the order that same traversal first reaches
+// it — so two functions built from different source but the same
+// underlying operations render identically, and go/ssa's own arbitrary
+// register numbers and block indices (which are not guaranteed stable or
+// meaningful across two independently-built functions) never leak into
+// the comparison.
+//
+// One ssaCanon is used for an entire top-level candidate, including any
+// closures nested inside it (a MakeClosure's function operand is rendered
+// by recursing into renderFunc), so token numbering runs continuously
+// across the whole tree — that's fine, since the same traversal produces
+// the same numbering for either side of a comparison.
+type ssaCanon struct {
+	pass    *analysis.Pass
+	qual    types.Qualifier
+	values  map[ssa.Value]string
+	nvalues int
+	blocks  map[*ssa.BasicBlock]int
+	nblocks int
 }
 
-func canonicalBody(pass *analysis.Pass, fd *ast.FuncDecl) string {
-	c := &canonicalizer{pass: pass, fd: fd, locals: map[types.Object]string{}}
-	// Parameters and named results are bound to placeholders by their
-	// declared position BEFORE the body is walked — see the package doc for
-	// why this must happen first rather than in order of first use.
-	c.bindFields(fd.Type.Params)
-	c.bindFields(fd.Type.Results)
-	return c.render(fd.Body)
-}
-
-func (c *canonicalizer) bindFields(fl *ast.FieldList) {
-	if fl == nil {
-		return
+func canonicalSSA(pass *analysis.Pass, fn *ssa.Function) string {
+	c := &ssaCanon{
+		pass:   pass,
+		qual:   types.RelativeTo(pass.Pkg),
+		values: map[ssa.Value]string{},
+		blocks: map[*ssa.BasicBlock]int{},
 	}
-	for _, field := range fl.List {
-		for _, name := range field.Names {
-			if name.Name == "_" {
-				continue
-			}
-			if obj := c.pass.TypesInfo.ObjectOf(name); obj != nil {
-				c.localToken(obj)
-			}
-		}
-	}
+	return c.renderFunc(fn)
 }
 
-func (c *canonicalizer) localToken(obj types.Object) string {
-	if tok, ok := c.locals[obj]; ok {
+func (c *ssaCanon) bindValue(v ssa.Value) string {
+	if tok, ok := c.values[v]; ok {
 		return tok
 	}
-	tok := fmt.Sprintf("L%d", len(c.locals))
-	c.locals[obj] = tok
+	tok := fmt.Sprintf("V%d", c.nvalues)
+	c.nvalues++
+	c.values[v] = tok
 	return tok
 }
 
-// isLocalTo reports whether obj was declared somewhere inside fd's own
-// source span — true for parameters, named results, and anything bound in
-// the body (:=, var, range/type-switch variables, a nested closure's own
-// parameters). Everything else — package-level names, imports, builtins —
-// has a position outside that span (or none at all) and is left as-is.
-func isLocalTo(fd *ast.FuncDecl, obj types.Object) bool {
-	if obj == nil {
-		return false
+func (c *ssaCanon) blockID(b *ssa.BasicBlock) int {
+	if id, ok := c.blocks[b]; ok {
+		return id
 	}
-	pos := obj.Pos()
-	return pos.IsValid() && fd.Pos() <= pos && pos < fd.End()
+	id := c.nblocks
+	c.nblocks++
+	c.blocks[b] = id
+	return id
 }
 
-var (
-	posType   = reflect.TypeOf(token.NoPos)
-	tokenType = reflect.TypeOf(token.ILLEGAL)
-)
-
-func (c *canonicalizer) render(n ast.Node) string {
-	if n == nil {
-		return "nil"
-	}
-	if rv := reflect.ValueOf(n); rv.Kind() == reflect.Ptr && rv.IsNil() {
-		return "nil"
-	}
-
-	switch x := n.(type) {
-	case *ast.Ident:
-		return c.renderIdent(x)
-	case *ast.BasicLit:
-		return "Lit(" + x.Kind.String() + ":" + x.Value + ")"
-	case *ast.CommentGroup, *ast.Comment:
-		return "" // comments never affect structural equality
-	}
-
-	rv := reflect.ValueOf(n)
-	if rv.Kind() == reflect.Ptr {
-		rv = rv.Elem()
-	}
-	t := rv.Type()
-	var b strings.Builder
-	b.WriteString(t.Name())
-	b.WriteByte('(')
-	for i := 0; i < t.NumField(); i++ {
-		ft := t.Field(i)
-		if ft.PkgPath != "" || ft.Type == posType {
-			continue // unexported resolver-internal field, or a source position — neither affects equality
+// blockOrder returns fn's reachable blocks in the deterministic order the
+// comparison uses: a depth-first walk from the entry block following each
+// block's successors in go/ssa's own recorded order, plus fn.Recover (if
+// present) as a second root — Recover is reached only via an implicit
+// panic-recovery edge, not through any block's ordinary Succs, so it needs
+// its own walk to be included at all. Assigns each block's canonical ID
+// as it's first visited.
+func (c *ssaCanon) blockOrder(fn *ssa.Function) []*ssa.BasicBlock {
+	var order []*ssa.BasicBlock
+	seen := map[*ssa.BasicBlock]bool{}
+	var visit func(b *ssa.BasicBlock)
+	visit = func(b *ssa.BasicBlock) {
+		if b == nil || seen[b] {
+			return
 		}
-		b.WriteString(c.renderValue(rv.Field(i)))
-		b.WriteByte(';')
+		seen[b] = true
+		c.blockID(b)
+		order = append(order, b)
+		for _, s := range b.Succs {
+			visit(s)
+		}
+	}
+	if len(fn.Blocks) > 0 {
+		visit(fn.Blocks[0])
+	}
+	visit(fn.Recover)
+	return order
+}
+
+// renderFunc renders fn's parameters, free variables (non-empty only for a
+// nested closure), and control flow graph. See the ssaCanon doc comment
+// for the overall approach.
+func (c *ssaCanon) renderFunc(fn *ssa.Function) string {
+	// Parameters and free variables are bound to placeholders by their
+	// declared position BEFORE the body is walked, exactly as the old
+	// AST-based version bound parameters first — a function can read them
+	// in any order, so they must be keyed by position, not by first use.
+	for _, p := range fn.Params {
+		c.bindValue(p)
+	}
+	for _, fv := range fn.FreeVars {
+		c.bindValue(fv)
+	}
+
+	order := c.blockOrder(fn)
+
+	// Every instruction-defined value is bound to a placeholder in
+	// canonical block/instruction order BEFORE anything is rendered: a Phi
+	// at a loop header can reference a value produced in the loop body, a
+	// block this traversal doesn't reach until later.
+	for _, b := range order {
+		for _, instr := range b.Instrs {
+			if _, ok := instr.(*ssa.DebugRef); ok {
+				continue // pure debug metadata; never affects equality, and not even emitted without GlobalDebug
+			}
+			if v, ok := instr.(ssa.Value); ok {
+				c.bindValue(v)
+			}
+		}
+	}
+
+	var out strings.Builder
+	for _, b := range order {
+		fmt.Fprintf(&out, "B%d(", c.blockID(b))
+		for _, instr := range b.Instrs {
+			if _, ok := instr.(*ssa.DebugRef); ok {
+				continue
+			}
+			out.WriteString(c.renderInstr(instr))
+			out.WriteByte(';')
+		}
+		out.WriteString(")->[")
+		for i, s := range b.Succs {
+			if i > 0 {
+				out.WriteByte(',')
+			}
+			fmt.Fprintf(&out, "B%d", c.blockID(s))
+		}
+		out.WriteString("]")
+		if b == fn.Recover {
+			out.WriteString("(recover)")
+		}
+		out.WriteByte(' ')
+	}
+	return out.String()
+}
+
+// renderInstr renders one instruction: its result placeholder (if it
+// defines a value), its kind, any non-Value fields that affect meaning
+// (an operator, a struct field index, an asserted type...), and its
+// Value-typed operands via Instruction.Operands — go/ssa's own complete,
+// order-stable enumeration of every value an instruction references, so
+// no instruction kind needs individually-listed operand fields here.
+//
+// *ssa.Phi is the one exception: it's rendered by renderPhi instead,
+// because its Operands (Phi.Edges) are keyed to Block().Preds by
+// position, an order that isn't otherwise canonicalized — see there.
+func (c *ssaCanon) renderInstr(instr ssa.Instruction) string {
+	if p, ok := instr.(*ssa.Phi); ok {
+		return c.renderPhi(p)
+	}
+
+	var b strings.Builder
+	v, isValue := instr.(ssa.Value)
+	if isValue {
+		b.WriteString(c.values[v])
+		b.WriteByte('=')
+	}
+	fmt.Fprintf(&b, "%T", instr)
+	b.WriteString(c.instrExtra(instr))
+	b.WriteByte('(')
+	for i, r := range instr.Operands(nil) {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		if r == nil || *r == nil {
+			b.WriteString("nil")
+		} else {
+			b.WriteString(c.renderValue(*r))
+		}
 	}
 	b.WriteByte(')')
+	if isValue {
+		b.WriteByte(':')
+		b.WriteString(types.TypeString(v.Type(), c.qual))
+	}
 	return b.String()
 }
 
-func (c *canonicalizer) renderIdent(id *ast.Ident) string {
-	if id.Name == "_" {
-		return "_"
+// renderPhi renders a Phi node's incoming edges keyed to each
+// predecessor's *canonical* block ID rather than its position in
+// Block().Preds — Preds order reflects the order edges were added while
+// building the CFG, an implementation detail that two structurally
+// identical functions aren't guaranteed to share, so the edges are sorted
+// by canonical predecessor ID before rendering.
+func (c *ssaCanon) renderPhi(p *ssa.Phi) string {
+	preds := p.Block().Preds
+	type edge struct {
+		pred int
+		val  string
 	}
-	if obj := c.pass.TypesInfo.ObjectOf(id); isLocalTo(c.fd, obj) {
-		return c.localToken(obj)
+	edges := make([]edge, len(p.Edges))
+	for i, e := range p.Edges {
+		val := "nil"
+		if e != nil {
+			val = c.renderValue(e)
+		}
+		edges[i] = edge{pred: c.blockID(preds[i]), val: val}
 	}
-	return "id:" + id.Name
+	sort.Slice(edges, func(i, j int) bool { return edges[i].pred < edges[j].pred })
+
+	var b strings.Builder
+	b.WriteString(c.values[p])
+	b.WriteString("=Phi(")
+	for i, e := range edges {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, "B%d:%s", e.pred, e.val)
+	}
+	b.WriteString("):")
+	b.WriteString(types.TypeString(p.Type(), c.qual))
+	return b.String()
 }
 
-func (c *canonicalizer) renderValue(fv reflect.Value) string {
-	switch fv.Kind() {
-	case reflect.Ptr:
-		if fv.IsNil() {
-			return "nil"
+// instrExtra renders the non-Value fields that affect an instruction's
+// meaning but aren't reachable via Operands — an operator, a struct field
+// index, an asserted type, and so on. Comment fields (Alloc, Phi) are
+// deliberately omitted: they're documentation hints, not semantics.
+func (c *ssaCanon) instrExtra(instr ssa.Instruction) string {
+	switch x := instr.(type) {
+	case *ssa.BinOp:
+		return fmt.Sprintf("{Op:%s}", x.Op)
+	case *ssa.UnOp:
+		return fmt.Sprintf("{Op:%s,CommaOk:%v}", x.Op, x.CommaOk)
+	case *ssa.Lookup:
+		return fmt.Sprintf("{CommaOk:%v}", x.CommaOk)
+	case *ssa.TypeAssert:
+		return fmt.Sprintf("{AssertedType:%s,CommaOk:%v}", types.TypeString(x.AssertedType, c.qual), x.CommaOk)
+	case *ssa.FieldAddr:
+		return fmt.Sprintf("{Field:%d}", x.Field)
+	case *ssa.Field:
+		return fmt.Sprintf("{Field:%d}", x.Field)
+	case *ssa.Alloc:
+		return fmt.Sprintf("{Heap:%v}", x.Heap)
+	case *ssa.Next:
+		return fmt.Sprintf("{IsString:%v}", x.IsString)
+	case *ssa.Extract:
+		return fmt.Sprintf("{Index:%d}", x.Index)
+	case *ssa.Select:
+		dirs := make([]string, len(x.States))
+		for i, s := range x.States {
+			dirs[i] = fmt.Sprintf("%d", s.Dir)
 		}
-		if n, ok := fv.Interface().(ast.Node); ok {
-			return c.render(n)
-		}
-		return "nil"
-	case reflect.Interface:
-		if fv.IsNil() {
-			return "nil"
-		}
-		if n, ok := fv.Interface().(ast.Node); ok {
-			return c.render(n)
-		}
-		return fmt.Sprintf("%v", fv.Interface())
-	case reflect.Slice:
-		parts := make([]string, fv.Len())
-		for i := range parts {
-			parts[i] = c.renderValue(fv.Index(i))
-		}
-		return "[" + strings.Join(parts, ",") + "]"
-	case reflect.Struct:
-		if fv.CanAddr() {
-			if n, ok := fv.Addr().Interface().(ast.Node); ok {
-				return c.render(n)
-			}
-		}
-		return fmt.Sprintf("%v", fv.Interface())
-	case reflect.Bool:
-		return fmt.Sprintf("%v", fv.Bool())
-	case reflect.String:
-		return fv.String()
+		return fmt.Sprintf("{Blocking:%v,Dirs:%s}", x.Blocking, strings.Join(dirs, ","))
+	case *ssa.Call:
+		return c.callExtra(&x.Call)
+	case *ssa.Go:
+		return c.callExtra(&x.Call)
+	case *ssa.Defer:
+		return c.callExtra(&x.Call)
 	default:
-		if fv.Type() == tokenType {
-			return token.Token(fv.Int()).String()
-		}
-		if fv.CanInt() {
-			return fmt.Sprintf("%d", fv.Int())
-		}
-		return fmt.Sprintf("%v", fv.Interface())
+		return ""
 	}
+}
+
+// callExtra renders the one part of a call that Operands doesn't cover:
+// for an interface-method invocation (CallCommon.IsInvoke), which method.
+// The receiver and arguments are ordinary Values, already covered by
+// Operands.
+func (c *ssaCanon) callExtra(cc *ssa.CallCommon) string {
+	if cc.IsInvoke() {
+		return "{Invoke:" + types.ObjectString(cc.Method, c.qual) + "}"
+	}
+	return ""
+}
+
+// renderValue renders one operand. A constant, a reference to a
+// package-level function/variable, or a builtin must match exactly, so it
+// prints as its literal identity; anything local — a parameter, a free
+// variable, or the result of some other instruction — must already have a
+// placeholder bound (renderFunc binds every one before rendering any
+// instruction), so it prints as that placeholder.
+func (c *ssaCanon) renderValue(v ssa.Value) string {
+	switch x := v.(type) {
+	case nil:
+		return "nil"
+	case *ssa.Const:
+		if x.Value == nil {
+			return "Const(" + types.TypeString(x.Type(), c.qual) + ":nil)"
+		}
+		return "Const(" + types.TypeString(x.Type(), c.qual) + ":" + x.Value.ExactString() + ")"
+	case *ssa.Builtin:
+		return "builtin:" + x.Name()
+	case *ssa.Global:
+		return "id:" + x.RelString(c.pass.Pkg)
+	case *ssa.Function:
+		return c.renderFunctionValue(x)
+	default:
+		if tok, ok := c.values[v]; ok {
+			return tok
+		}
+		// Dominance guarantees every operand's defining instruction was
+		// already visited while binding placeholders, so this should be
+		// unreachable — bind it now rather than panic if it somehow isn't.
+		return c.bindValue(v)
+	}
+}
+
+// renderFunctionValue renders a reference to a *ssa.Function: a named
+// function or method (anything with an Object — a symbol declared in
+// source) must match exactly, by qualified name, same as any other
+// non-local identifier. An anonymous function literal has no such
+// identity to compare by, so its own control flow graph is compared
+// instead, by recursing into renderFunc.
+func (c *ssaCanon) renderFunctionValue(fn *ssa.Function) string {
+	if obj := fn.Object(); obj != nil {
+		return "id:" + fn.RelString(c.pass.Pkg)
+	}
+	return "closure(" + c.renderFunc(fn) + ")"
 }
 
 // isGenerated matches the "// Code generated ... DO NOT EDIT." marker

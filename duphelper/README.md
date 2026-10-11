@@ -25,20 +25,31 @@ A top-level `func` (no receiver) that:
    parameter and result *names* don't matter (`ptrFloat64(v float64)
    *float64` and `ptrFloat64Widget(w float64) *float64` match), but every
    parameter/result *type*, the result count, and variadic-ness must.
-2. Has an **alpha-equivalent body** — identical statement-for-statement and
-   expression-for-expression once locals (parameters, named results, and
-   anything the body itself declares) are replaced by a position-keyed
-   placeholder instead of their literal name. Anything that *isn't* local —
-   a package-level name, an import, a field/method selector, a literal's
-   exact value — must still match exactly. Two functions with the same
-   shape that read different globals, call different things, or return
-   different constants are not duplicates.
+2. Compiles to the **same control flow graph in SSA form** — identical
+   basic blocks, branches, and operations, once each function's parameters,
+   free variables, and instruction results are replaced by a
+   position-keyed placeholder instead of go/ssa's own arbitrary register
+   numbers. Anything that *isn't* local — a call to a package-level
+   function, a global, a struct field index, a constant's exact value —
+   must still match exactly. Two functions with the same shape that read
+   different globals, call different things, or return different
+   constants are not duplicates.
 
-Parameters and named results are keyed by their **declared position**, not
-by the order they're first read in the body — see [`analyzer.go`](analyzer.go)'s
-package doc for why that distinction matters (a naive first-use ordering
+   Comparing compiled SSA rather than syntax means duphelper catches pairs
+   an AST-level comparison can't: a `for` loop and an equivalent `while`-style
+   loop over the same condition can compile to the identical CFG even
+   though they're different statement kinds in the source (see
+   `firstNegativeWhile`/`firstNegativeCountingFor` in `testdata/demo`), and
+   `0xA` and `10` are the same constant once compiled even though they're
+   different literals in source (see `timeoutSecondsHex`/
+   `timeoutSecondsDecimal`). See [`analyzer.go`](analyzer.go)'s package doc
+   for the full comparison algorithm, including why this compares
+   *canonical form* rather than running a general graph-isomorphism search.
+
+Parameters and free variables are keyed by their **declared position**, not
+by the order they're first read in the body — a naive first-use ordering
 would wrongly match two functions that pick *different* operands out of the
-same two parameters).
+same two parameters (see `clampLow`/`clampHigh` in `testdata/demo`).
 
 The second (and any later) declaration in a matching group is reported,
 pointing back at the first — "first" meaning earliest by filename then line,
@@ -97,7 +108,8 @@ it doesn't do" above. Two patterns that work well:
 ## Configuration
 
 None — there's nothing to tune. A match is either exact (by type, and
-alpha-equivalent body) or it isn't; there's no threshold to raise or lower.
+compiled control flow graph) or it isn't; there's no threshold to raise or
+lower.
 
 ## Known limitations
 
@@ -107,9 +119,20 @@ alpha-equivalent body) or it isn't; there's no threshold to raise or lower.
   export/import along the import graph to catch — not attempted yet.
 - **Methods aren't compared**, only free functions. See "What it doesn't
   do" above.
-- **Labels are compared by literal text, not alpha-renamed.** Two
-  otherwise-identical functions using differently-named `goto` labels for
-  the same control flow won't match — a missed finding, never a false one.
+- **Branch order matters.** The comparison walks each function's blocks in
+  a fixed order derived from real branch semantics (an `If`'s first
+  successor is always its true branch), not a symmetric one. Two functions
+  that are otherwise identical but invert a condition and swap its two
+  branches render differently and won't match — a missed finding, never a
+  false one. See [`analyzer.go`](analyzer.go)'s package doc for why this
+  trade-off was made over a full graph-isomorphism search.
+- **Not every equivalent loop rewrite matches.** A `for` loop and a
+  `while`-style loop over the same condition usually compile to the
+  identical CFG (see `testdata/demo`), but a `for range` loop over a slice
+  lowers through go/ssa's own fixed index-and-length convention, which
+  often differs from what a hand-written counting loop over the same slice
+  produces even when both do the same work — so that particular pair is a
+  missed finding too, not a guaranteed catch.
 - **An empty-bodied function is never a candidate.** Matching stubs isn't
   an interesting finding.
 - **Comments never affect the comparison** (deliberate, not a limitation in

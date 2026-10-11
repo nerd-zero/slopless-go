@@ -11,12 +11,12 @@
     { "id": "fingerprint", "label": "Fingerprint" },
     { "id": "outcome", "label": "Outcome", "variant": "exception" }
   ],
-  "mainPath": ["fn_b", "sig", "body", "fp", "group", "report"],
+  "mainPath": ["fn_b", "sig", "ssa", "fp", "group", "report"],
   "nodes": [
     { "id": "fn_a", "lane": "source", "col": 0, "type": "frontend", "label": "ptrFloat64(v float64) *float64", "sublabel": "pointers.go — declared first", "width": 260 },
     { "id": "fn_b", "lane": "source", "col": 0, "type": "frontend", "label": "ptrFloat64Widget(w float64) *float64", "sublabel": "widgets.go — looks new", "width": 260, "yOffset": 76 },
     { "id": "sig", "lane": "analyzer", "col": 1, "type": "backend", "label": "Signature key", "sublabel": "types only, names ignored", "width": 150 },
-    { "id": "body", "lane": "analyzer", "col": 2, "type": "backend", "label": "Alpha-equivalent body", "sublabel": "locals bound by position", "width": 165 },
+    { "id": "ssa", "lane": "analyzer", "col": 2, "type": "backend", "label": "Canonical SSA CFG", "sublabel": "go/ssa, blocks/values bound by position", "width": 200 },
     { "id": "fp", "lane": "fingerprint", "col": 3, "type": "database", "label": "Fingerprint table", "sublabel": "key -> declarations", "width": 135 },
     { "id": "group", "lane": "fingerprint", "col": 4, "type": "database", "label": "Group >= 2?", "sublabel": "per unique fingerprint", "width": 130 },
     { "id": "report", "lane": "outcome", "col": 5, "type": "security", "label": "Report duplicate", "sublabel": "points back at the original", "tag": "reuse it", "width": 150 },
@@ -24,8 +24,8 @@
   ],
   "edges": [
     { "from": "fn_b", "to": "sig", "variant": "emphasis" },
-    { "from": "sig", "to": "body", "variant": "emphasis" },
-    { "from": "body", "to": "fp", "variant": "emphasis" },
+    { "from": "sig", "to": "ssa", "variant": "emphasis" },
+    { "from": "ssa", "to": "fp", "variant": "emphasis" },
     { "from": "fp", "to": "group", "variant": "emphasis" },
     { "from": "group", "to": "report", "variant": "emphasis", "label": "yes" },
     { "from": "group", "to": "skip", "variant": "dashed", "role": "branch", "label": "no" },
@@ -33,7 +33,7 @@
   ],
   "cards": [
     { "dot": "cyan", "title": "Type, Not Name", "items": ["Parameter and result names never matter", "Every parameter/result type, count, and variadic-ness must match exactly", "func(v float64) *float64 and func(w float64) *float64 key the same"] },
-    { "dot": "emerald", "title": "Position, Not Order", "items": ["Parameters bind to placeholders by declared position, before the body is walked", "A body read a, b differently from b, a is a real difference, never flattened", "This is what keeps clampLow and clampHigh from false-matching"] },
+    { "dot": "emerald", "title": "Compiled Form, Not Syntax", "items": ["Each candidate is compiled to SSA and walked in a fixed, branch-semantics-driven block order", "Parameters, free variables, and instruction results bind to placeholders by that order, not go/ssa's own arbitrary register numbers", "Catches pairs an AST comparison can't — e.g. an equivalent for-loop and while-loop rewrite"] },
     { "dot": "rose", "title": "Advisory, Not a Gate", "items": ["Single package only - no cross-package or exported-helper awareness yet", "Methods and generic functions are never compared", "Every finding is a candidate for a human, never a verdict"] }
   ]
 }

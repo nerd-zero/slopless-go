@@ -26,7 +26,9 @@ jobs:
       # each tool's demo explicitly too — it's real, runnable example code,
       # not fixtures. Add a line here for each new tool's demo package.
       - name: build examples
-        run: go build ./singlecaller/testdata/demo/...
+        run: |
+          go build ./singlecaller/testdata/demo/...
+          go build ./duphelper/testdata/demo/...
 
       - name: make test
         run: make test
